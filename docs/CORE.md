@@ -39,6 +39,7 @@ struct Position {
 }
 ```
 - **owner**: Position owner (EOA or contract)
+- For EZWrapper ez-flow positions, `owner` is EZWrapper and user attribution is tracked in EZWrapper.
 - **tokenId**: LP NFT id
 - **token0/token1**: Underlying tokens
 - **fee/tickSpacing**: Pool parameters (Uniswap/Aerodrome)
@@ -63,7 +64,6 @@ Enriched view with live amounts, fees, and valuation.
 * **allowedPools**: Pools are tracked with a lifecycle status (`Allowed`, `Deprecated`, `NotAllowed`). Read-only and valuation flows treat `Allowed` and `Deprecated` as allowed for inspection, but `CLManager` will refuse to open new positions on `Deprecated` pools — use `CLCore.setPoolStatus` to manage statuses.
 * **allowedBots**: Only these addresses can perform bot-aware flows.
 * **bridgeTokens**: Allowed intermediate tokens (e.g., WETH) for routing USDC.
-* **zeroFeeWallets**: Wallets exempt from protocol fees (e.g. testing, promotions).
 
 ---
 
@@ -88,7 +88,7 @@ Enriched view with live amounts, fees, and valuation.
 
 ### 3.4. Dust Management
 - Tracks leftover USDC ("dust").
-- Push model: Manager transfers funds to Core before calling `addDust`.
+- Push model: Manager transfers funds to Core before calling `addDustToPosition`.
 
 ### 3.5. Metadata Updates
 - Updates NFT id and tick range after re-minting (change range) and re-validates tick alignment and bounds.
@@ -101,7 +101,6 @@ Enriched view with live amounts, fees, and valuation.
 *   `setPoolStatus`: Manage pool lifecycle and status (Allowed / Deprecated / NotAllowed).
 *   `addBot / removeBot`: Whitelist bots.
 *   `setBridgeTokens`: Configure routing tokens.
-*   `setZeroFeeWallet(address, bool)`: Toggle fee exemption for specific wallets.
 *   `pause() / unpause()`: Guardian-only emergency stop.
 
 ### 3.7. Fee Configuration

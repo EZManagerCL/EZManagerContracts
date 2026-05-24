@@ -9,13 +9,13 @@ Throughout the EZManager protocol, the contract owner is a Timelock contract, wh
 The protocol uses a two-tier governance structure to balance security and responsiveness:
 
 1.  **Timelock (Owner)**
-    *   Owns all core contracts (CLCore, CLManager, Adapters, Valuation, RebalancePlanner).
+    *   Owns all core contracts (CLCore, CLManager, EZWrapper, ReferralManager, Adapters, Valuation, RebalancePlanner).
     *   Functions protected by  (e.g., changing fees, whitelisting adapters, allowing new pools) must go through the Timelock.
     *   Provides a time delay for users to exit if they disagree with a proposed change.
 
 2.  **Multisig (Proposer & Guardian)**
     *   **Proposer**: The multisig is the proposer for the Timelock. It initiates actions that can be executed by the Timelock after the delay.
-    *   **Guardian**: The multisig is directly assigned the `guardian` role on all contracts (CLCore, CLManager, Adapters). This allows it to call `pause()` and `unpause()` instantly, bypassing the Timelock delay for emergency response.
+    *   **Guardian**: The multisig is directly assigned the `guardian` role on all contracts (CLCore, CLManager, EZWrapper, ReferralManager, Adapters). This allows it to call `pause()` and `unpause()` instantly, bypassing the Timelock delay for emergency response.
 
 ---
 
@@ -25,10 +25,14 @@ The protocol uses a two-tier governance structure to balance security and respon
     *   Set Manager / Guardian
     *   Add/Remove Allowed Pools & Dexes
     *   Set Protocol/Bot Fees
+    *   Configure Manager, EZWrapper, ReferralManager, and fee discounts
+    *   Configure Manager collect/compound bot fee multiplier
     *   Configure Rebalance/Valuation params
 *   **Guardian (Multisig)**: Has emergency control.
     *   Pause / Unpause contracts
 *   **Manager (CLManager contract)**: The only address allowed to mutate `CLCore` state for position lifecycle.
+*   **EZWrapper**: Optional wrapper that owns ez-flow positions in `CLCore`, maps those keys to users, and forwards direct bot action proceeds.
+*   **ReferralManager**: Persistent referral registry and balance book. CLManager is the only address allowed to resolve/store manager-flow referrers and credit referral fees.
 *   **Bots**: Whitelisted addresses (added by Owner) that can perform specific maintenance tasks.
     *   Require two-layer permissioning: Global Allowlist (Core) + Per-Position Flag (User opt-in).
 

@@ -10,6 +10,8 @@ This protocol is fully documented in the `docs/` directory, with deep, code-accu
 - [ACCOUNTING.md](docs/ACCOUNTING.md): Canonical USDC accounting, invariants, and flows
 - [USER_GUIDE.md](docs/USER_GUIDE.md): Step-by-step user and bot flows
 - [MANAGER.md](docs/MANAGER.md): Manager contract, permissioning, and flows
+- [EZ_WRAPPER.md](docs/EZ_WRAPPER.md): Optional ez wrapper flows and bot-action proceeds
+- [REFERRAL_MANAGER.md](docs/REFERRAL_MANAGER.md): Persistent referral registry, fee crediting, and claims
 - [CORE.md](docs/CORE.md): CLCore contract, data structures, and accounting
 - [ALLOWED_POOLS.md](docs/ALLOWED_POOLS.md): Administrative model for tracking and managing allowed pools.
 - [ADAPTERS.md](docs/ADAPTERS.md): Adapter interface, DEX integration, and extension
@@ -30,13 +32,13 @@ This protocol is fully documented in the `docs/` directory, with deep, code-accu
 - [Core Contracts](#core-contracts)
   - [CLCore](#clcore)
   - [CLManager](#clmanager)
+  - [EZWrapper](#ezwrapper)
   - [Adapters](#adapters)
     - [UniswapAdapter](#uniswapadapter)
-    - [AerodromeAdapter](#aerodromeadapter)
+  - [AerodromeAdapter](#aerodromeadapter)
   - [RebalancePlanner](#rebalanceplanner)
   - [Valuation](#valuation)
-  - [ProtocolReserve](#protocolreserve)
-- [Deployment and Initialization](#deployment-and-initialization)
+  - [ReferralManager](#referralmanager)
 - [User Flows](#user-flows)
   - [Opening a Position](#opening-a-position)
   - [Adding/Removing Collateral](#addingremoving-collateral)
@@ -57,10 +59,11 @@ EZManager is a modular protocol for managing concentrated liquidity positions ac
 EZManager is composed of several core contracts:
 - **CLCore**: Canonical state and accounting for all positions. Holder of all position NFTs and tracked dust.
 - **CLManager**: User-facing contract for opening, managing, and exiting positions.
+- **EZWrapper**: Optional wrapper for ez flows and user proceeds from direct bot actions on wrapper-owned positions.
+- **ReferralManager**: Persistent wallet referrer registry and referral balance accounting.
 - **Adapters**: Per-DEX adapters (Uniswap/PancakeSwap, Aerodrome) that abstract DEX-specific logic.
 - **RebalancePlanner**: Computes optimal swap amounts for rebalancing.
 - **Valuation**: Provides USDC-equivalent valuation for any token using DEX pools.
-- **ProtocolReserve**: Stores and distributes protocol fees to shareholders.
 
 ## Core Contracts
 
@@ -97,7 +100,10 @@ EZManager is composed of several core contracts:
 - Restricts pairs to USDC-direct pools or bridge-token routed pairs; pools must be pre-allowlisted in CLCore.
 
 **Key Flows:**
-- `openPosition`: Opens a new position, seeds with USDC, handles protocol fee, and registers in CLCore.
+- `openPosition`: Opens a new position, seeds with USDC, charges the capital-entry protocol fee, resolves the wallet referrer, and registers in CLCore. An overload accepts a candidate referrer.
+- `openPositionEz`: EZWrapper-only ez open; registers the position to EZWrapper while attributing referral state to the real user.
+- `importNft`: Imports an existing caller-owned LP NFT into CLCore tracking after validating it against an allowed pool, initializing the caller's referrer when needed, and applying the caller's initial bot permission setting.
+- `copyPosition`: Opens a direct position using a source position's pool and range. The copied/source position owner receives a source reward funded from the copied open's capital-entry protocol fee using `copyReferralShareBps`; if the copier has no stored referrer, the source owner is also stored as the copier's wallet referrer.
 - `exitPosition`: Unwinds all liquidity, swaps to USDC, refunds dust, and deregisters.
 - `addCollateral`/`removeCollateral`: Adjusts position's USDC collateral.
 - `collectFeesToUSDC`/`compoundFees`: Collects/compounds fees for one or more positions.
@@ -107,7 +113,18 @@ EZManager is composed of several core contracts:
 - `onlyKeyOwner`, `onlyKeyOwnerOrBot` for permissioned actions.
 
 **Events:**
-- PositionOpened, PositionExited, FeesCollected, FeesCompounded, RangeChanged, CollateralAdded/Removed, ProtocolFeePaid, BotFeePaid
+- PositionOpened, PositionImported, PositionCopied, PositionExited, FeesCollected, FeesCompounded, RangeChanged, CollateralAdded/Removed, ProtocolFeePaid, ReferralFeePaid, BotFeePaid
+
+### EZWrapper
+
+**Purpose:**
+- Optional user-facing wrapper around CLManager for ez opens/adds/removes/exits.
+- Tracks wrapper-owned position keys by user while CLCore records EZWrapper as the position owner.
+- Forwards direct bot collect/exit proceeds on wrapper-owned positions to the mapped user.
+
+**Key Flows:**
+- `ezOpen`: Pulls USDC from the caller, opens through CLManager with bots enabled, and stores the key for the caller.
+- `ezAdd`/`ezRemove`/`ezExit`: Let the mapped user manage wrapper-owned positions through EZWrapper.
 
 ### Adapters
 
@@ -150,46 +167,51 @@ Adapters abstract DEX-specific logic and expose a unified interface for CLManage
 - `setCore(core)` — admin: configure CORE (one-time).
 - `refreshAll()` — owner-only: refresh cached edges from `CLCore.listAllowedPools()` (best-effort; emits `Refreshed` and `RefreshFailed`).
 
-### ProtocolReserve
+### ReferralManager
 
 **Purpose:**
-- Stores protocol fees in USDC.
-- Allows owner to set share recipients and sweep reserves.
+- Stores wallet-level referrers and claimable referral balances.
+- Lets CLManager resolve/store referrers and credit referral fees.
+- Uses a fixed earned-fee referral share and a separate copy referral share.
+- Persists independently from CLManager and EZWrapper deployments.
 
 **Key Functions:**
-- `setShares`, `sweepReserves`, `usdcBalance`, `getShares`
+- `storeReferrer`, `storedReferrer`
+- `creditReferralFee`, `claimReferralFees`
+- `setManager`, `setDefaultReferrer`, `setReferralShareBps`, `setCopyReferralShareBps`
 
-## Deployment and Initialization
-
-Deployment is managed by the `Deploy.sol` script, which:
-- Deploys all core contracts and adapters (Uniswap, Aerodrome, PancakeSwap via the UniswapAdapter variant).
-- Wires permissions, connects contracts, and sets initial allowlists. After setup, transfers ownership to timelock with multisig as proposer.
-- Persists deployed addresses to `addresses.json`.
+**Default referral model:**
+- Referral fees are paid from existing protocol fees and never add to the user's total fee.
+- `referralShareBps` defaults to 2,000, so the stored referrer receives 20% of earned-fee protocol fees.
+- `copyReferralShareBps` defaults to 5,000, so the copied/source position owner receives 50% of the capital-entry protocol fee charged on a copied open.
+- `referrerUserCount` tracks the number of wallets assigned to each referrer for UI/display only.
 
 ## User Flows
 
 ### Opening a Position
-1. User calls `openPosition` on `CLManager` with pool address, DEX adapter, tick range, USDC amount, and slippage.
-2. Protocol fee is deducted and sent to `ProtocolReserve`.
+1. User calls `openPosition` on `CLManager` with pool address, tick range, USDC amount, bot permission flag, slippage, and optionally a candidate referrer. The configured EZWrapper calls `openPositionEz` for ez opens.
+2. Capital-entry protocol fee is deducted and sent to `ProtocolReserve`. CLManager resolves and stores the user's wallet referrer for later referral attribution.
 3. Adapter mints a new position and transfers the NFT to `CLCore`.
 4. `CLCore.registerPosition` verifies it owns the NFT (`ownerOf(tokenId) == CLCore`) before registering with full metadata and totalDepositedUSDC.
 5. Any leftover USDC after mint is tracked as dust.
 
 ### Adding/Removing Collateral
-- **Add:** User calls `addCollateral`, which increases totalDepositedUSDC and adds liquidity via the adapter.
-- **Remove:** User calls `removeCollateral`, which burns a fraction of liquidity and returns USDC, reducing totalDepositedUSDC.
+- **Add:** User calls `addCollateral`, which resolves the user's wallet referrer, stores the default referrer if none is set, charges the capital-entry protocol fee, increases totalDepositedUSDC, and adds liquidity via the adapter.
+- **Remove:** User calls `removeCollateral`, which burns a fraction of liquidity and returns net USDC, reducing totalDepositedUSDC. If the burn realizes pending LP fees, the earned-fee protocol fee is charged only on that realized fee value.
 
 ### Changing Range
 - User or bot calls `changeRange` to fully unwind and remint a position with a new tick range.
-- Protocol or bot fee is applied as appropriate on the total value of the newly minted position.
+- No rebalance protocol fee is charged on principal or full position value. Pending earned fees are collected to tokens before the range change, and `earnedFeesProtocolFeeBps` is charged only from those collected fee tokens; the default is 10% before wallet discounts. Bot-called changeRange also pays the base bot fee from the reminted position value.
 
 ### Fee Collection and Compounding
-- **Collect:** Owner or bot calls `collectFeesToUSDC` (batch) to collect fees, swap them to USDC, and transfer proceeds to the owner (bot receives a fee share when the caller is a bot).
-- **Compound:** Owner or bot calls `compoundFees` (batch) to collect fees to tokens and add them back into liquidity (bot receives a fee share when the caller is a bot; the fee is derived from the collected fees and does not use principal).
+- **Collect:** Owner or bot calls `collectFeesToUSDC` (batch) to collect fees, swap them to USDC, pay the earned-fee protocol fee, and transfer net proceeds to the owner (bot receives a fee share from the same gross collected-fee basis when the caller is a bot).
+- **Compound:** Owner or bot calls `compoundFees` (batch) to collect fees to tokens, pay the earned-fee protocol fee from those tokens, and add net fees back into liquidity (bot receives a fee share from the same gross collected-fee basis when the caller is a bot; principal is not used).
+- Collect/compound bot fees use the manager's `botFeeMultiplierForEarnedFees` before wallet discounts. With deployed defaults, the 0.05% base bot fee and `20` multiplier produce a 1% collect/compound bot fee before wallet discounts.
+- CLManager wallet discounts are always evaluated against the registered position owner. A 100% discount is a full fee exemption. For ez positions, the owner is EZWrapper, so the mapped user's discount does not apply.
 
 ### Exiting a Position
 - Owner or bot calls `exitPosition` to unwind all liquidity, swap to USDC, refund dust, and deregister the position.
-- Bot receives a fee cut on total value removed if caller was bot.
+- Bot receives the base bot fee on realized USDC proceeds excluding refunded dust if the caller is a bot. The collect/compound bot fee multiplier does not apply.
 
 ## Security
 
@@ -198,7 +220,7 @@ Deployment is managed by the `Deploy.sol` script, which:
 - All major contracts are owned by a timelock contract, so all admin functions aside from pause are subject to a minimum 2 day timelock.
 - In case of emergency, even when paused, users can withdraw their position NFTs from the protocol. Timelock owner can also send position NFTs to their key owners in case of unrecoverable exploit and necessary contract migration.
 - Slippage protection is enforced via on-chain TWAP oracles.
-- Users only ever directly interact with CLManager, which interacts with other contracts.
+- Users may interact directly with CLManager or use EZWrapper for ez flows.
 
 ## Events and Error Handling
 

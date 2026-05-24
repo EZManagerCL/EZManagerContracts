@@ -1,89 +1,147 @@
 
-
 # RebalancePlanner: Optimal Liquidity and Swap Planning
 
-This document provides a detailed, descriptive overview of the `RebalancePlanner` contract and logic in the EZManager protocol. It covers the algorithms, integration flows, and code references as implemented.
+This document provides a detailed overview of the `RebalancePlanner` contract and its solver behavior in EZManager.
 
 ---
-
 
 ## 1. Purpose and Architecture
 
-`RebalancePlanner` is responsible for computing the optimal swap amounts and token allocation for concentrated liquidity positions, maximizing efficiency and minimizing dust. The contract is invoked by `CLManager` to plan mint/add/rebalance flows. All integration and configuration of the planner is managed by the Timelock/Gnosis Safe multisig.
+`RebalancePlanner` computes the optimal swap amounts for a concrete token bundle and target concentrated-liquidity range.
 
 **Responsibilities:**
-- Compute optimal swap amounts for a given range and token bundle
-- Require callers to supply the exact token balances (USDC or bridge-token paired assets)
-- Use "implicit tick walking" probes (SqrtPriceMath) plus damped Newton iterations with exact Uniswap V3 math (no external quoters)
-- Produce deterministic swap plans for adapters and manager while remaining stable across liquidity cliffs
+- Compute deterministic swap instructions for mint/add flows
+- Operate directly on token0/token1 balances after seeding from USDC
+- Use exact concentrated-liquidity math instead of external quoters
+- Validate the concrete pool against the configured adapter/factory before solving
+- Stay stable across thin-liquidity, initialized-tick boundaries, and pool-specific bitmap behavior
+
+The planner is constructed with `CLCore` and caches the bridge tokens fixed there at deployment. The planner only supports pools where at least one side is USDC or one side is one of those bridge tokens.
 
 ---
 
+## 2. Main Entry Point
 
-## 2. Key Functions and Flows
+### 2.1. `planFromTokenBundle`
 
-### 2.1. planFromTokenBundle
-- Computes the optimal swap for an arbitrary token0/token1 bundle using the exact target pool
-- Callers supply the concrete token0/token1 bundle they intend to mint/increase with (in protocol flows, seeding from USDC is handled by adapters)
-- Returns deterministic swap instructions expressed as token0→token1 and token1→token0 amounts
-
-### 2.2. Internal Solver
-- Uses a damped Newton-Raphson iteration to equalize liquidity contributed by token0 and token1
-- Applies exact V3 math (TickMath/SqrtPriceMath) to probe through ticks without explicit tick walking
-- Caps iterations and early stops, only consuming them when the imbalance is large (whale trades)
-
----
-
-
-## 3. Algorithmic Details
-
-### 3.1. Newton Iteration for Optimal Swap
-- The solver maximizes the minimum liquidity contributed by token0 and token1 within the target range.
-- Each iteration converts the bundle into "liquidity units" using current sqrt price, computing the ideal balance.
-- Damping plus implicit probes adapt to liquidity cliffs.
-
-### 3.2. Overshoot Protection
-- When a probe causes the solver to flip directions (indicating a cliff), it automatically backtracks by half the last move.
-- This "shock absorber" prevents oscillations and lets the solver approach thin liquidity safely.
-
-### 3.3. Deterministic Inputs
-- Since adapters perform any USDC→bridge-token seeding, the planner operates purely on concrete token balances.
-- No on-chain Quoter calls are required, reducing gas significantly.
-- Pool context (tick spacing, fees, liquidity) is fetched directly from the target pool, and pool addresses are gated via the adapter factory plus CLCore's `allowedPools` allowlist.
-
-Defensive ordering note:
-- The planner reads `pool.token0()` / `pool.token1()` and swaps the provided amounts internally when the caller supplies `token0`/`token1` in the opposite order, ensuring the solver’s `amount0`/`amount1` always correspond to the pool’s ordering.
-
-### 3.4. Handling Rounding and Dust
-- Any leftover tokens after the optimal swap are handled by `CLManager` as dust and credited to the position.
-
----
-
-
-## 4. Practical Examples
-
-### 4.1. Planning from Token Bundle
 ```solidity
-// Example: providing 5,000 token0 and 7,000 token1
-planFromTokenBundle(dex, pool, token0, token1, tickLower, tickUpper, 5_000e18, 7_000e18);
-// Returns: swap plan (token0ToToken1, token1ToToken0)
+planFromTokenBundle(
+    dex,
+    pool,
+    token0,
+    token1,
+    tickLower,
+    tickUpper,
+    amount0,
+    amount1
+)
 ```
 
+The planner:
+
+- validates the pool context
+- checks that the supplied pair is USDC-linked or bridge-token-linked
+- aligns caller-supplied tokens with the pool's actual ordering
+- computes the optimal swap direction and size
+- returns:
+
+```solidity
+struct RebalanceParams {
+    uint256 token0ToToken1;
+    uint256 token1ToToken0;
+}
+```
+
+Only one side is non-zero in a valid plan.
+
 ---
 
+## 3. Inputs and Trust Boundaries
 
-## 5. Integration in Protocol Flows
+- Adapters handle USDC seeding and any bridge-token routing before the planner runs
+- The planner works on the concrete token bundle that will actually be minted or added
+- Pool context is fetched directly from the target pool and validated through the adapter/DEX wiring
+- Token ordering is normalized internally: if the caller supplies `(token1, token0)`, the planner swaps the working amounts to match the pool's canonical ordering
+- For Uniswap-style pools, the planner validates the pool by `(tokenA, tokenB, fee)`
+- For Aerodrome/Slipstream pools, the planner validates the pool by `(tokenA, tokenB, tickSpacing)` and uses the factory's current `getSwapFee(pool)` as the math fee when available
 
-- `CLManager` calls `RebalancePlanner` before minting or adding liquidity to ensure positions are optimally balanced for the target range, reducing dust and maximizing capital efficiency.
-- Adapters receive these swap instructions from `CLManager`.
+The planner does not move funds and does not depend on external quote contracts.
+
+---
+
+## 4. Solver Behavior
+
+### 4.1. Objective
+
+The solver ranks candidate states after pricing dust in token1 terms. When two candidates differ, it prefers:
+
+- mintable states over non-mintable states
+- higher achievable liquidity
+- lower total dust value
+- smaller absolute signed dust imbalance between the two sides
+- smaller gross swap amount
+
+### 4.2. Segment Solve
+
+The implementation uses:
+
+- exact V3 math
+- a deterministic phase flow: enter range if needed, walk initialized segments until the solution is bracketed, then solve inside the active segment
+- exact swap-step simulation using `SwapMath.computeSwapStep`
+- the closed-form quadratic from `POSSIBLE_CLOSED_FORM.md` to solve for the target in-range sqrt price
+- a small local exact-evaluation correction around the predicted gross input to absorb integer swap rounding
+
+The planner uses one explicit walk limit:
+
+- `MAX_WALK_TICKS`: shared boundary-walk budget across both entry-from-outside and in-range segment walking before terminal approximation
+
+### 4.3. Tick Cross Handling
+
+If the target swap crosses an initialized tick, the planner walks to that boundary, applies the tick's liquidity delta, and then continues in the next active segment. Once the active segment brackets the solution, the planner solves the closed form inside that segment against the pre-step state. This keeps the in-range solve aligned with the pool's actual active liquidity.
+
+For Slipstream pools, tick crossing uses the pool `ticks()` liquidity net without adding any separate staked-liquidity delta. If the pool does not expose a readable tick bitmap, the planner hard-fails with `UnsupportedBitmap()` instead of silently approximating from incomplete state.
+
+If a tick crossing would require invalid active-liquidity math, the planner hard-fails with `InvalidPoolLiquidityState()` instead of panicking on arithmetic. This covers cases such as:
+
+- removing more active liquidity than remains during a crossing
+- adding enough liquidity to overflow `uint128`
+- malformed liquidity-net values that would overflow crossing math
+
+### 4.4. Entry From Outside the Range
+
+If the current price starts below `tickLower`, the planner first spends token1 to move toward the lower bound. If the current price starts above `tickUpper`, it first spends token0 to move toward the upper bound.
+
+If the bundle runs out before reaching the target boundary, or if all usable inventory is consumed while entering the range, the planner returns that one-sided entry swap directly.
+
+### 4.5. Early Returns and Bounds
+
+The planner returns an all-zero plan when:
+
+- pool liquidity is zero
+- the current bundle already scores as balanced for the requested range
+
+Returned swap amounts are always clamped to the caller's original `amount0` / `amount1` balances.
 
 ---
 
+## 5. Practical Integration
 
-## 6. Security and Operational Details
+The planner is used by:
 
-- All calculations performed by `RebalancePlanner` are pure/view-only and cannot move funds.
-- Because adapters handle all swapping for bridge tokens, the planner operates deterministically on provided balances.
-- Returned swap plans are enforced by adapters, which also handle any dust or rounding edge cases.
+- `CLManager.openPosition`
+- `CLManager.addCollateral`
+- `CLManager.compoundFees`
+- `CLManager.changeRange`
+
+Adapters receive the resulting `RebalanceParams` and execute any required rebalance swap before minting or increasing liquidity.
 
 ---
+
+## 6. Operational Notes
+
+- The planner is deterministic for a given pool state and token bundle
+- Dust handling remains outside the planner and is handled by manager/adapter flows
+- The planner reads `slot0()` through a low-level staticcall so it can decode only `sqrtPriceX96` and `tick` across pool variants with different return layouts
+- Invalid pool wiring, invalid ticks, missing DEX adapter wiring, unreadable `slot0`, or missing fee data all hard-fail before solving
+- The owner can tune the exact walk depth via `setMaxWalkTicks(uint256)`
+- Token ordering is normalized internally, so callers do not need to pre-sort supplied amounts as long as token addresses are correct

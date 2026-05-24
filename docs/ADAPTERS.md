@@ -23,7 +23,7 @@ Adapters abstract all DEX-specific logic and expose a unified interface to `CLMa
 
 ### 2.1. UniswapAdapter
 - Integrates Uniswap V3 pools and also powers the PancakeSwap variant via an `isPancakeSwap` flag (router signature differences only)
- - Uses slippage protection. Slippage is provided by callers as a `slippageBps` parameter (basis points) and forwarded from the manager to adapters.
+- Uses slippage protection. Callers provide `slippageBps` to `CLManager`; the manager converts that tolerance into a USDC-denominated `remainingLossUSDC` budget and passes that budget into adapter entrypoints.
 - Emits `Minted`, `Increased`, `Removed`, `Unwound`, `Swapped` events
 
 ### 2.2. AerodromeAdapter
@@ -86,7 +86,7 @@ adapter.swapExactInToUSDC(...);
 ## 5. Security and Best Practices
 
 - All state-changing functions are permissioned (onlyManager, set by the Timelock/Gnosis Safe multisig)
- - Slippage protection is enforced on all swaps and liquidity actions. Callers provide `slippageBps` (basis points) which adapters use to validate minOut values and revert when slippage bounds are exceeded.
+- Slippage protection is enforced on all swaps and liquidity actions. Callers provide `slippageBps` to `CLManager`; adapters receive the derived `remainingLossUSDC` budget and use it to validate minOut values and revert when slippage bounds are exceeded.
 - Pausable for emergency stops (controlled by the Gnosis Safe multisig)
 
 ---

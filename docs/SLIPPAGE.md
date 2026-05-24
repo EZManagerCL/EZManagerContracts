@@ -4,12 +4,14 @@ This document describes how a caller-provided `slippageBps` budget is enforced a
 
 Policy:
 - User-funded multi-step actions enforce a single shared budget across sequential sub-operations by tracking a remaining USDC loss budget.
-- Protocol/bot fee conversions are outside the user budget model (they do not consume the user-funded `remainingLossUSDC`), but still enforce slippage using a separate loss budget derived from the notional being swapped and the caller-provided `slippageBps`.
+- Protocol/bot fee conversions are outside the user budget model (they do not consume the user-funded `remainingLossUSDC`), but still enforce slippage using a separate loss budget derived from the notional being swapped and the applicable slippage bps.
+- When a fee-token sale is performed to fund an earned-fee protocol fee, including the combined protocol/bot fee sale in `compoundFees`, the slippage tolerance used for that fee conversion is capped at `maxProtocolFeeSlippageBps`.
 
 ## Conventions
 
 - `slippageBps` is a basis-point tolerance (`BPS = 10_000`).
 - All user-supplied `slippageBps` values are clamped to `0..9999` before use.
+- `maxProtocolFeeSlippageBps` is a protocol-level cap applied only to swaps made specifically to fund earned-fee protocol fees.
 - The manager derives an absolute slippage budget in USDC token units (`remainingLossUSDC`) and threads it through the flow.
 - A flow may apply budgets at multiple layers:
   - **Manager-level** (between multiple swaps or between seeding and later steps).
@@ -23,6 +25,11 @@ For a given flow, the manager defines a `baseUSDC` amount (USDC token units) for
 - `remainingLossUSDC = ceil(baseUSDC * slippageBps / BPS)`
 
 `remainingLossUSDC` is the remaining USDC-denominated shortfall that may be realized (vs TWAP expectations) across all user-funded operations in the flow.
+
+For earned-fee protocol-fee sale swaps, the manager first applies the protocol cap:
+
+- `feeSlippageBps = min(slippageBps, maxProtocolFeeSlippageBps)`
+- `remainingLossUSDC = ceil(expectedSellUSDC * feeSlippageBps / BPS)`
 
 ## Realized Budget Consumption (Per Swap)
 
@@ -62,15 +69,10 @@ All `ceil(...)` operations use conservative rounding so budget is never accident
     - mint mins (`amount0Min` / `amount1Min`)
     - dust conversion (sequential per dust swap) using the remaining budget after rebalance/mint
   - Returns `remainingLossUSDCOut`.
-- Step 3 (optional): second pass uses the remaining loss budget returned by the adapter from step 2; see `CLManager._maybeSecondPass`.
 
 ### `CLManager.addCollateral`
 
 - Same budgeting structure as `openPosition`, but `addLiquidity` is called instead of `mintPosition`.
-
-### `CLManager._maybeSecondPass` (open/add/compound/changeRange follow-on)
-
-- Uses the `remainingLossUSDC` budget passed in by the parent flow (no recomputation) and threads it through `seedPairFromUSDC` and `addLiquidity`.
 
 ### `CLManager.exitPosition`
 
@@ -84,24 +86,25 @@ All `ceil(...)` operations use conservative rounding so budget is never accident
 - Single adapter call per position: `collectFeesToUSDC(..., remainingLossUSDC)` (adapter)
   - The adapter applies a single `remainingLossUSDC` budget sequentially across the internal swaps required to convert fee tokens to USDC.
 
-### `CLManager.compoundFees` (bot-fee sell + reinvest)
+### `CLManager.compoundFees` (earned-fee/bot-fee sell + reinvest)
 
 - Step 1: fee collection to tokens: `collectFeesToTokens(...)` (adapter)
   - No slippage budget; this is a pure collect.
-- Step 2 (bot only): manager sells a portion of collected fee tokens to USDC to pay the bot via `swapExactInToUSDC`
-  - This conversion is outside the user budget model; the manager derives a fresh `remainingLossUSDC` from the expected USDC value of the tokens being sold and applies it sequentially across the required swap(s).
+- Step 2: manager sells a portion of collected fee tokens to USDC to pay the earned-fee protocol fee and, when bot-called, the bot fee via `swapExactInToUSDC`
+  - The protocol and bot fee targets are both calculated from the same gross USDC-equivalent value of the collected fee tokens, then one converted USDC amount is split by target weights.
+  - This conversion is outside the user budget model; the manager derives a fresh `remainingLossUSDC` from the expected USDC value of the tokens being sold using `min(slippageBps, maxProtocolFeeSlippageBps)` and applies it sequentially across the required swap(s).
 - Step 3: reinvest remaining fees: `addLiquidity(..., remainingLossUSDC)` (adapter)
   - Adapter applies the flow's `remainingLossUSDC` budget sequentially across the rebalance swap (if any), the liquidity mins, and dust conversion.
-- Step 4: optional second pass uses `_maybeSecondPass` (see above).
 
 ### `CLManager.changeRange`
 
-- Step 1: `unwindToTokens(...)` (adapter) to retrieve the full position token bundle.
-- Step 2: `mintPosition(..., remainingLossUSDC)` (adapter)
+- Step 1: if pending fees exist, `collectFeesToTokens(...)` collects them before unwind.
+  - The manager sells only the earned-fee protocol-fee portion of collected fee tokens to USDC using a fresh loss budget derived from that fee sale and capped by `maxProtocolFeeSlippageBps`.
+- Step 2: `unwindToTokens(...)` (adapter) to retrieve the full position token bundle.
+- Step 3: `mintPosition(..., remainingLossUSDC)` (adapter)
   - Adapter applies the flow's `remainingLossUSDC` budget sequentially across the rebalance swap (if any), the mint mins, and dust conversion.
-- Step 3: fee assessment (protocol + optional bot fee) via `removeLiquidityBpsUSDC(..., slippageBps)` (adapter)
-  - This conversion is outside the user budget model; the manager derives a fresh `remainingLossUSDC` from the expected USDC notional being removed and uses it for any token→USDC conversions required inside the adapter.
-- Step 4: optional second pass uses `_maybeSecondPass` (see above).
+- Step 4: if bot-called, bot fee assessment via `removeLiquidityBpsUSDC(..., slippageBps)` (adapter)
+  - This conversion is outside the user budget model; the manager derives a fresh `remainingLossUSDC` from the expected bot-fee notional being removed and uses it for any token→USDC conversions required inside the adapter.
 
 ## Adapter Internal Splits (Common Patterns)
 

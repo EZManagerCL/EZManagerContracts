@@ -8,7 +8,8 @@ import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
-import {ICLDexAdapter, RebalanceParams, Position, RegisterParams, PositionValueResult, PendingFeesResult, PositionDetails, ICLCore, IValuation, ICLPool, IAerodromeFactory, IUniswapV3Factory, IUniswapV3Pool, ISlipstreamPoolState, INonfungiblePositionManager, IRebalancePlanner} from "./Interfaces.sol";
+import {ICLDexAdapter, RebalanceParams, Position, PositionDetails, RegisterParams, ICLCore, IValuation, IRebalancePlanner, IEZWrapper, IReferralManager, INonfungiblePositionManager} from "./Interfaces.sol";
+import {CLManagerUtils} from "./libraries/CLManagerUtils.sol";
 
 /* ─────────────────────────── CLManager ─────────────────────────── */
 
@@ -16,6 +17,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
     using SafeERC20 for IERC20;
 
     error UsdcDecimalsTooLow();
+    error OwnershipRenounceDisabled();
     
     constructor(address core_, address owner_) Ownable(owner_) {
         if (core_ == address(0) || owner_ == address(0)) revert ZeroAddress();
@@ -23,9 +25,6 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         USDC = CORE.USDC();
         usdcDecimals = IERC20Metadata(address(USDC)).decimals();
         if (usdcDecimals < 3) revert UsdcDecimalsTooLow();
-        // SECOND_PASS_MIN_USDC = $0.001 in token units.
-        SECOND_PASS_MIN_USDC = 10 ** uint256(usdcDecimals - 3);
-
         // MINIMUM_OPEN_USDC defaults to $1 in token units.
         MINIMUM_OPEN_USDC = 10 ** uint256(usdcDecimals);
 
@@ -38,13 +37,6 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
     uint8 public usdcDecimals;
 
     uint256 public constant BPS = 10_000;
-
-    // Threshold bps to trigger second pass liquidity addition 
-    // if leftover USDC is large enough.
-    uint256 public SECOND_PASS_THRESHOLD_BPS = 1; // 0.01%
-
-    // Minimum USDC (in token units) to trigger second pass.
-    uint256 public SECOND_PASS_MIN_USDC;
 
     // Minimum USDC (in token units) required to open a new position (defaults to $1)
     uint256 public MINIMUM_OPEN_USDC;
@@ -60,6 +52,12 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
     IERC20 public USDC;
     IValuation public VALUATION;
     IRebalancePlanner public PLANNER;
+    IReferralManager public REFERRAL_MANAGER;
+    IEZWrapper public EZ_WRAPPER;
+    uint16 public botFeeMultiplierForEarnedFees = 20;
+    uint16 public earnedFeesProtocolFeeBps = 1_000;
+    uint16 public maxProtocolFeeSlippageBps = 1_500;
+    mapping(address => uint16) public discountedFeeWallets;
 
     /* ───────────── Events ───────────── */
 
@@ -73,6 +71,8 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         address token1,
         uint256 depositedUSDC,
         uint256 protocolFeeUSDC,
+        address referrer,
+        uint256 referralFeeUSDC,
         uint256 dustAdded
     );
 
@@ -81,7 +81,9 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         bytes32 indexed key,
         uint256 indexed tokenId,
         uint256 returnedUSDC,
-        uint256 feesCollected
+        uint256 feesCollected,
+        uint256 protocolFeeUSDC,
+        uint256 referralFeeUSDC
     );
 
     event PositionNftReturned(
@@ -98,7 +100,9 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         uint256 indexed tokenId,
         uint256 fee0,
         uint256 fee1,
-        uint256 usdcOut
+        uint256 usdcOut,
+        uint256 protocolFeeUSDC,
+        uint256 referralFeeUSDC
     );
 
     event FeesCompounded(
@@ -107,7 +111,10 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         uint256 indexed tokenId,
         uint256 compoundedUSDC,
         uint256 used0,
-        uint256 used1
+        uint256 used1,
+        uint256 protocolFeeUSDC,
+        uint256 referralFeeUSDC,
+        uint256 dustAdded
     );
 
     event RangeChanged(
@@ -122,6 +129,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         uint256 positionValueBefore,
         uint256 positionValueAfter,
         uint256 protocolFeeUSDC,
+        uint256 referralFeeUSDC,
         uint256 feesCollected
     );
 
@@ -132,7 +140,8 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         uint256 depositedUSDC,
         uint256 addedUSDC,
         uint256 totalCollateralUSDC,
-        uint256 protocolFeeUSDC
+        uint256 protocolFeeUSDC,
+        address referrer
     );
 
     event CollateralRemoved(
@@ -141,6 +150,8 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         uint256 indexed tokenId,
         uint256 returnedUSDC,
         uint256 feesCollected,
+        uint256 protocolFeeUSDC,
+        uint256 referralFeeUSDC,
         uint256 removedUSDC,
         uint256 totalCollateralUSDC
     );
@@ -163,6 +174,48 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         FeeType feeType
     );
 
+    event ReferralFeePaid(
+        address indexed referrer,
+        address indexed user,
+        bytes32 indexed key,
+        uint256 grossUSDC,
+        uint256 referralFeeUSDC,
+        uint256 netUSDC,
+        FeeType feeType
+    );
+
+    event PositionCopied(
+        address indexed user,
+        bytes32 indexed sourceKey,
+        bytes32 indexed key,
+        address sourceOwner,
+        bool botAllowed
+    );
+
+    event PositionImported(
+        address indexed user,
+        bytes32 indexed key,
+        uint256 indexed tokenId,
+        address dex,
+        address pool,
+        address token0,
+        address token1,
+        uint256 importedUSDC,
+        address referrer
+    );
+
+    event PlannerUpdated(address indexed planner);
+    event ValuationUpdated(address indexed valuation);
+    event GuardianUpdated(address indexed guardian);
+    event EZWrapperUpdated(address indexed ezWrapper);
+    event ReferralManagerUpdated(address indexed referralManager);
+    event DiscountedWalletBpsUpdated(address indexed wallet, uint16 discountBps);
+    event BotFeeMultiplierForEarnedFeesUpdated(uint16 multiplier);
+    event EarnedFeesProtocolFeeBpsUpdated(uint16 feeBps);
+    event MaxProtocolFeeSlippageBpsUpdated(uint16 slippageBps);
+    event MinimumOpenUSDCUpdated(uint256 minimumOpenUSDC);
+    event MaxBatchKeysUpdated(uint256 maxBatchKeys);
+
     /* ───────────── Errors ───────────── */
     error NotGuardian();
     error NotOwner();
@@ -183,20 +236,18 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
     error ZeroAmount();
     error PositionTooSmall();
     error InvalidTickRange();
+    error RangeUnchanged();
     error EmptyKeys();
     error ZeroAddress();
     error TickAlignmentError();
     error PoolNotInitialized();
+    error NotEZWrapper();
+    error InvalidReferrer();
+    error FeeTooHigh();
+    error AlreadySet();
+    error ReferralManagerNotSet();
 
     /* ───────────── Internal Types ───────────── */
-
-    struct CompoundContext {
-        address owner;
-        uint256 tokenId;
-        address token0;
-        address token1;
-        address dex;
-    }
 
     enum FeeType {
         Open,
@@ -204,7 +255,13 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         CollateralAdd,
         ChangeRange,
         Exit,
-        Compound
+        Compound,
+        CollateralRemove
+    }
+
+    struct ReferralInfo {
+        address referrer;
+        uint16 shareBps;
     }
 
     /* ───────────── Initialization & Admin ───────────── */
@@ -213,37 +270,73 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
     function setPlanner(address planner_) external onlyOwner {
         if (planner_ == address(0)) revert ZeroAddress();
         PLANNER = IRebalancePlanner(planner_);
+        emit PlannerUpdated(planner_);
     }
 
     /// @notice Set the valuation contract used for token -> USDC pricing
     function setValuation(address valuation_) external onlyOwner {
         if (valuation_ == address(0)) revert ZeroAddress();
         VALUATION = IValuation(valuation_);
+        emit ValuationUpdated(valuation_);
     }
 
     /// @notice Set the guardian address for quick pause/unpause.
     function setGuardian(address g) external onlyOwner {
         if (g == address(0)) revert ZeroAddress();
         guardian = g;
+        emit GuardianUpdated(g);
+    }
+
+    function setEZWrapper(address ezWrapper_) external onlyOwner {
+        if (ezWrapper_ == address(0)) revert ZeroAddress();
+        if (address(EZ_WRAPPER) != address(0)) revert AlreadySet();
+        EZ_WRAPPER = IEZWrapper(ezWrapper_);
+        emit EZWrapperUpdated(ezWrapper_);
+    }
+
+    function setReferralManager(address referralManager_) external onlyOwner {
+        if (referralManager_ == address(0)) revert ZeroAddress();
+        REFERRAL_MANAGER = IReferralManager(referralManager_);
+        emit ReferralManagerUpdated(referralManager_);
+    }
+
+    function setDiscountedWalletBps(address wallet, uint16 discountBps) external onlyOwner {
+        if (wallet == address(0)) revert ZeroAddress();
+        if (discountBps > BPS) revert FeeTooHigh();
+        discountedFeeWallets[wallet] = discountBps;
+        emit DiscountedWalletBpsUpdated(wallet, discountBps);
+    }
+
+    function setBotFeeMultiplierForEarnedFees(uint16 multiplier) external onlyOwner {
+        if (multiplier > 50) revert FeeTooHigh();
+        botFeeMultiplierForEarnedFees = multiplier;
+        emit BotFeeMultiplierForEarnedFeesUpdated(multiplier);
+    }
+
+    function setEarnedFeesProtocolFeeBps(uint16 feeBps) external onlyOwner {
+        if (feeBps > 2_000) revert FeeTooHigh();
+        earnedFeesProtocolFeeBps = feeBps;
+        emit EarnedFeesProtocolFeeBpsUpdated(feeBps);
+    }
+
+    function setMaxProtocolFeeSlippageBps(uint16 slippageBps) external onlyOwner {
+        if (slippageBps >= BPS) revert FeeTooHigh();
+        maxProtocolFeeSlippageBps = slippageBps;
+        emit MaxProtocolFeeSlippageBpsUpdated(slippageBps);
     }
 
     /// @notice Set the minimum USDC (in token units) required to open a position
     function setMinimumOpenUSDC(uint256 min_) external onlyOwner {
         if (min_ == 0) revert InvalidParams();
         MINIMUM_OPEN_USDC = min_;
+        emit MinimumOpenUSDCUpdated(min_);
     }
 
     /// @notice Set the maximum number of keys that can be processed in batch operations
     function setMaxBatchKeys(uint256 maxKeys_) external onlyOwner {
         if (maxKeys_ == 0) revert InvalidParams();
         MAX_BATCH_KEYS = maxKeys_;
-    }
-
-    /// @notice Configure second-pass behavior: leftover threshold (bps) and minimum USDC
-    function setSecondPassParams(uint256 thresholdBps_, uint256 minUsdc_) external onlyOwner {
-        if (thresholdBps_ > BPS) revert InvalidParams();
-        SECOND_PASS_THRESHOLD_BPS = thresholdBps_;
-        SECOND_PASS_MIN_USDC = minUsdc_;
+        emit MaxBatchKeysUpdated(maxKeys_);
     }
 
     function pause() external onlyGuardian {
@@ -252,6 +345,10 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
 
     function unpause() external onlyGuardian {
         _unpause();
+    }
+
+    function renounceOwnership() public view override onlyOwner {
+        revert OwnershipRenounceDisabled();
     }
 
     /* ───────────── Modifiers/Permissions ───────────── */
@@ -278,9 +375,20 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         _;
     }
 
-    function _requireOwnerOrBot(address owner, bool botAllowed, bool callerIsBot) internal view {
-        if (owner == msg.sender) return;
-        if (!callerIsBot || !botAllowed) revert NotOwner();
+    function _utilsConfig() internal view returns (CLManagerUtils.Config memory cfg) {
+        cfg = CLManagerUtils.Config({
+            CORE: CORE,
+            USDC: USDC,
+            VALUATION: VALUATION,
+            PLANNER: PLANNER,
+            MAX_BATCH_KEYS: MAX_BATCH_KEYS,
+            MINIMUM_OPEN_USDC: MINIMUM_OPEN_USDC,
+            botFeeMultiplierForEarnedFees: botFeeMultiplierForEarnedFees,
+            earnedFeesProtocolFeeBps: earnedFeesProtocolFeeBps,
+            maxProtocolFeeSlippageBps: maxProtocolFeeSlippageBps,
+            EZ_WRAPPER: EZ_WRAPPER,
+            REFERRAL_MANAGER: REFERRAL_MANAGER
+        });
     }
 
     /* ───────────── Core User Flows ───────────── */
@@ -298,8 +406,185 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         int24 tickLower,
         int24 tickUpper,
         uint256 usdcAmount,
+        bool botAllowed,
         uint256 slippageBps
     ) external nonReentrant whenNotPaused returns (bytes32 key) {
+        return _openPosition(
+            msg.sender,
+            msg.sender,
+            pool,
+            tickLower,
+            tickUpper,
+            usdcAmount,
+            botAllowed,
+            slippageBps,
+            _resolveDepositReferrer(msg.sender, address(0))
+        );
+    }
+
+    function openPosition(
+        address pool,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 usdcAmount,
+        bool botAllowed,
+        uint256 slippageBps,
+        address referrer
+    ) external nonReentrant whenNotPaused returns (bytes32 key) {
+        return _openPosition(
+            msg.sender,
+            msg.sender,
+            pool,
+            tickLower,
+            tickUpper,
+            usdcAmount,
+            botAllowed,
+            slippageBps,
+            _resolveDepositReferrer(msg.sender, referrer)
+        );
+    }
+
+    function openPositionEz(
+        address user,
+        address pool,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 usdcAmount,
+        bool botAllowed,
+        uint256 slippageBps,
+        address referrer
+    ) external nonReentrant whenNotPaused returns (bytes32 key) {
+        if (msg.sender != address(EZ_WRAPPER)) revert NotEZWrapper();
+        return _openPosition(
+            msg.sender,
+            user,
+            pool,
+            tickLower,
+            tickUpper,
+            usdcAmount,
+            botAllowed,
+            slippageBps,
+            _resolveDepositReferrer(user, referrer)
+        );
+    }
+
+    function copyPosition(
+        bytes32 sourceKey,
+        uint256 usdcAmount,
+        bool botAllowed,
+        uint256 slippageBps
+    ) external nonReentrant whenNotPaused returns (bytes32 key) {
+        Position memory source = CORE.getPosition(sourceKey);
+        if (source.owner == address(0) || source.tokenId == 0) revert PositionNotFound();
+
+        address sourceOwner = source.owner;
+        if (sourceOwner == address(EZ_WRAPPER)) {
+            sourceOwner = EZ_WRAPPER.userForKey(sourceKey);
+        }
+        if (sourceOwner == msg.sender) revert InvalidReferrer();
+
+        if (address(REFERRAL_MANAGER) == address(0)) revert ReferralManagerNotSet();
+        REFERRAL_MANAGER.storeReferrer(msg.sender, sourceOwner);
+        key = _openPosition(
+            msg.sender,
+            msg.sender,
+            source.pool,
+            source.tickLower,
+            source.tickUpper,
+            usdcAmount,
+            botAllowed,
+            slippageBps,
+            ReferralInfo({referrer: sourceOwner, shareBps: REFERRAL_MANAGER.copyReferralShareBps()})
+        );
+        emit PositionCopied(msg.sender, sourceKey, key, sourceOwner, botAllowed);
+    }
+
+    function importNft(uint256 tokenId, address pool, bool botAllowed)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (bytes32 key)
+    {
+        return _importNft(tokenId, pool, botAllowed, address(0));
+    }
+
+    function importNft(uint256 tokenId, address pool, bool botAllowed, address referrer)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (bytes32 key)
+    {
+        return _importNft(tokenId, pool, botAllowed, referrer);
+    }
+
+    function _importNft(uint256 tokenId, address pool, bool botAllowed, address referrer) internal returns (bytes32 key) {
+        if (tokenId == 0 || pool == address(0)) revert InvalidParams();
+        address resolvedReferrer = _storeReferrer(msg.sender, referrer);
+
+        (address dex, address token0, address token1, uint24 fee, int24 tickSpacing) = _resolveDexForPool(pool);
+        _requirePoolInitialized(pool);
+        ICLDexAdapter adapter = ICLDexAdapter(dex);
+        address npm = adapter.getNPM();
+        if (npm == address(0)) revert InvalidParams();
+        if (INonfungiblePositionManager(npm).ownerOf(tokenId) != msg.sender) revert NotOwner();
+
+        (,, address nftToken0, address nftToken1, uint24 nftFeeOrTickSpacing, int24 tickLower, int24 tickUpper,,,,,) =
+            INonfungiblePositionManager(npm).positions(tokenId);
+        if (token0 != nftToken0 || token1 != nftToken1) revert InvalidParams();
+        if (adapter.isAerodrome()) {
+            int24 nftTickSpacing = int24(nftFeeOrTickSpacing);
+            if (nftTickSpacing <= 0 || nftTickSpacing != tickSpacing) revert InvalidParams();
+        } else if (nftFeeOrTickSpacing == 0 || nftFeeOrTickSpacing != fee) {
+            revert InvalidParams();
+        }
+
+        INonfungiblePositionManager(npm).safeTransferFrom(msg.sender, address(CORE), tokenId);
+
+        key = CORE.registerPosition(RegisterParams({
+            owner: msg.sender,
+            tokenId: tokenId,
+            token0: token0,
+            token1: token1,
+            fee: fee,
+            tickSpacing: tickSpacing,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            totalDepositedUSDC: 0,
+            dex: dex
+        }));
+
+        PositionDetails memory details = CORE.getPositionDetails(key);
+        if (botAllowed) CORE.setBotAllowedForPosition(key, true);
+        uint256 importedUSDC = details.valueUSDCNow;
+        if (importedUSDC < MINIMUM_OPEN_USDC) revert PositionTooSmall();
+        if (importedUSDC > 0) {
+            CORE.adjustTotalDeposited(key, int256(importedUSDC));
+        }
+
+        emit PositionImported(
+            msg.sender,
+            key,
+            tokenId,
+            dex,
+            pool,
+            token0,
+            token1,
+            importedUSDC,
+            resolvedReferrer
+        );
+    }
+
+    function _openPosition(
+        address owner_,
+        address effectiveUser,
+        address pool,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 usdcAmount,
+        bool botAllowed,
+        uint256 slippageBps,
+        ReferralInfo memory feeReferrer
+    ) internal returns (bytes32 key) {
         slippageBps = slippageBps >= BPS ? BPS - 1 : slippageBps;
         if (usdcAmount == 0) revert InvalidParams();
         if (pool == address(0)) revert InvalidParams();
@@ -307,37 +592,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         // Don't allow tiny positions to avoid DOS on backend.
         if (usdcAmount < MINIMUM_OPEN_USDC) revert PositionTooSmall();
 
-        // Select a validated adapter from CORE's allowlist by attempting to validate the pool.
-        address[] memory dexes = CORE.listAllowedDexes();
-        address dex = address(0);
-        address token0;
-        address token1;
-        uint24 fee;
-        int24 tickSpacing;
-
-        for (uint256 i = 0; i < dexes.length; ++i) {
-            address tryDex = dexes[i];
-            if (tryDex == address(0)) continue;
-            try ICLDexAdapter(tryDex).validateAndGetPoolParams(pool) returns (address t0, address t1, uint24 f, int24 ts) {
-                // success: use this adapter
-                dex = tryDex;
-                token0 = t0;
-                token1 = t1;
-                fee = f;
-                tickSpacing = ts;
-                break;
-            } catch {
-                // try next adapter
-            }
-        }
-        // No supported dex found for pool
-        if (dex == address(0)) revert DexNotAllowed();
-
-        // Require pool is allowlisted by CORE registry.
-        if (!CORE.isPoolAllowed(pool)) revert PoolNotAllowed();
-        // Disallow opening new positions on deprecated (phasing out) pools.
-        if (CORE.isPoolDeprecated(pool)) revert PoolDeprecated();
-
+        (address dex, address token0, address token1, uint24 fee, int24 tickSpacing) = _resolveDexForPool(pool);
         ICLDexAdapter adapter = ICLDexAdapter(dex);
 
         // Basic validation: ticks must align with spacing and form a valid range.
@@ -345,31 +600,21 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         if (tickLower >= tickUpper) revert InvalidTickRange();
         if (tickLower < -887272 || tickUpper > 887272) revert InvalidTickRange();
 
-        // Ensure pool is initialized (has non-zero sqrtPriceX96) to avoid low-level NPM reverts.
-        {
-            (bool ok, bytes memory data) = pool.staticcall(abi.encodeWithSignature("slot0()"));
-            if (!ok || data.length < 32) revert PoolNotInitialized();
-            // decode first uint256 (sqrtPriceX96)
-            (uint256 w0) = abi.decode(data, (uint256));
-            uint160 sqrtPriceX96 = uint160(w0);
-            if (sqrtPriceX96 == 0) revert PoolNotInitialized();
-        }
+        _requirePoolInitialized(pool);
 
-        (uint16 protocolFeeBps_, address reserve) = _protocolFeeConfig();
-        if (_isZeroFee(msg.sender)) {
-            protocolFeeBps_ = 0;
-        }
+        (uint16 protocolFeeBps_, address reserve) = _discountedProtocolFeeConfig(owner_, 0);
 
         // Pull gross USDC from the user.
         USDC.safeTransferFrom(msg.sender, address(this), usdcAmount);
 
         // Protocol fee is taken from the deposit but does not reduce totalDepositedUSDC
         // since totalDepositedUSDC tracks the full gross external USDC the owner contributed.
-        uint256 protocolFeeUSDC = _protocolFeeAmount(usdcAmount, protocolFeeBps_);
-        uint256 seedNet = usdcAmount - protocolFeeUSDC;
+        (uint256 protocolFeeUSDC, uint256 referralFeeUSDC, uint256 seedNet) =
+            _depositFees(usdcAmount, protocolFeeBps_, feeReferrer);
 
-        if (protocolFeeUSDC > 0) {
-            USDC.safeTransfer(reserve, protocolFeeUSDC);
+        uint256 reserveFeeUSDC = protocolFeeUSDC - referralFeeUSDC;
+        if (reserveFeeUSDC > 0) {
+            USDC.safeTransfer(reserve, reserveFeeUSDC);
         }
 
         // Seed either directly with USDC or via a configured bridge token through the adapter.
@@ -399,7 +644,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         );
 
         // Mints position via user-specified allowlisted adapter.
-        (uint256 tokenId, , , uint256 leftoverUSDC, uint256 remainingLossUSDCFinal) = ICLDexAdapter(dex).mintPosition(
+        (uint256 tokenId, , , uint256 leftoverUSDC, ) = ICLDexAdapter(dex).mintPosition(
             token0,
             token1,
             address(USDC),
@@ -414,21 +659,8 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
             remainingLossUSDCOut
         );
 
-        leftoverUSDC = _maybeSecondPass(
-            dex,
-            pool,
-            token0,
-            token1,
-            tickLower,
-            tickUpper,
-            tokenId,
-            leftoverUSDC,
-            usdcAmount,
-            remainingLossUSDCFinal
-        );
-
         RegisterParams memory params = RegisterParams({
-            owner: msg.sender,
+            owner: owner_,
             tokenId: tokenId,
             token0: token0,
             token1: token1,
@@ -441,24 +673,28 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         });
 
         key = CORE.registerPosition(params);
+        if (botAllowed) CORE.setBotAllowedForPosition(key, true);
 
         // Track adapter leftover as per-position dust in CORE.
         _addDust(key, leftoverUSDC);
 
         if (protocolFeeUSDC > 0) {
             emit ProtocolFeePaid(
-                msg.sender,
+                owner_,
                 key,
                 tokenId,
                 usdcAmount,
-                protocolFeeUSDC,
+                reserveFeeUSDC,
                 seedNet,
                 FeeType.Open
             );
         }
+        if (referralFeeUSDC > 0) {
+            _payReferralFee(feeReferrer.referrer, effectiveUser, key, usdcAmount, referralFeeUSDC, seedNet, FeeType.Open);
+        }
 
         emit PositionOpened(
-            msg.sender,
+            owner_,
             key,
             tokenId,
             dex,
@@ -466,7 +702,9 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
             token0,
             token1,
             usdcAmount,
-            protocolFeeUSDC,
+            reserveFeeUSDC,
+            feeReferrer.referrer,
+            referralFeeUSDC,
             leftoverUSDC
         );
     }
@@ -480,83 +718,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         nonReentrant
         whenNotPaused
     {
-        slippageBps = slippageBps >= BPS ? BPS - 1 : slippageBps;
-        if (keys.length == 0) revert EmptyKeys();
-        if (keys.length > MAX_BATCH_KEYS) revert TooManyInBatch(MAX_BATCH_KEYS);
-        bool callerIsBot = CORE.allowedBots(msg.sender);
-        uint16 botFeeBps_ = CORE.botFeeBps();
-
-        for (uint256 k = 0; k < keys.length; ++k) {
-            bytes32 key = keys[k];
-            Position memory p = CORE.getPosition(key);
-            if (p.owner == address(0) || p.tokenId == 0) revert PositionNotFound();
-
-            _requireOwnerOrBot(p.owner, p.botAllowed, callerIsBot);
-
-            // Use CORE's on-chain computed pending USDC for the position.
-            PositionDetails memory det = CORE.getPositionDetails(key);
-            uint256 feesCollectedAtStart = det.pendingFeesUSDC;
-
-            bool zeroFeeOwner = _isZeroFee(p.owner);
-            uint16 botFeeBpsLocal = zeroFeeOwner ? 0 : botFeeBps_;
-
-            uint256 usdcBefore = USDC.balanceOf(address(this));
-
-            // Unwind NFT to underlying tokens (may include USDC already).
-            (address[] memory toks, uint256[] memory amts) =
-                ICLDexAdapter(p.dex).unwindToTokens(abi.encode(p.tokenId), address(this));
-
-            // Swap all non-USDC tokens to USDC using a single USDC-denominated loss budget.
-            uint256 swapBaseUSDC = 0;
-            for (uint256 i = 0; i < toks.length; ++i) {
-                if (amts[i] > 0 && toks[i] != address(USDC)) {
-                    swapBaseUSDC += _tokenValueUSDC(p.dex, toks[i], amts[i]);
-                }
-            }
-
-            uint256 remainingLossUSDC = _lossBudgetUSDC(swapBaseUSDC, slippageBps);
-            for (uint256 i = 0; i < toks.length; ++i) {
-                address token = toks[i];
-                uint256 amount = amts[i];
-                if (amount == 0) continue;
-                if (token == address(USDC)) continue;
-
-                // Transfer token to adapter so it can swap from its own balance.
-                IERC20(token).safeTransfer(p.dex, amount);
-                (, remainingLossUSDC) = ICLDexAdapter(p.dex).swapExactInToUSDC(
-                    token,
-                    amount,
-                    address(USDC),
-                    address(this),
-                    remainingLossUSDC
-                );
-            }
-
-            // Withdraw tracked dust from CORE before deregistration to refund it.
-            uint256 dustFromCore = CORE.withdrawDustForPosition(key, address(this), type(uint256).max);
-
-            CORE.deregisterPosition(key);
-
-            uint256 usdcAfter = USDC.balanceOf(address(this));
-            uint256 returnedUSDC = usdcAfter - usdcBefore;
-
-            // Bot fee is taken from the non-dust portion of exit proceeds.
-            if (callerIsBot && botFeeBpsLocal > 0 && returnedUSDC > 0) {
-                uint256 feeBase = returnedUSDC > dustFromCore ? returnedUSDC - dustFromCore : 0;
-                uint256 botFeeUSDC = FullMath.mulDiv(feeBase, botFeeBpsLocal, BPS);
-                if (botFeeUSDC > 0) {
-                    returnedUSDC = returnedUSDC > botFeeUSDC ? returnedUSDC - botFeeUSDC : 0;
-                    USDC.safeTransfer(msg.sender, botFeeUSDC);
-                    emit BotFeePaid(msg.sender, key, p.tokenId, botFeeUSDC, FeeType.Exit);
-                }
-            }
-
-            if (returnedUSDC > 0) {
-                USDC.safeTransfer(p.owner, returnedUSDC);
-            }
-
-            emit PositionExited(p.owner, key, p.tokenId, returnedUSDC, feesCollectedAtStart);
-        }
+        CLManagerUtils.exitPosition(_utilsConfig(), keys, slippageBps);
     }
 
     /**
@@ -576,47 +738,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         external
         nonReentrant
     {
-        if (keys.length == 0) revert EmptyKeys();
-        if (keys.length > MAX_BATCH_KEYS) revert TooManyInBatch(MAX_BATCH_KEYS);
-        bool isProtocolOwner = msg.sender == owner();
-
-        for (uint256 i = 0; i < keys.length; ++i) {
-            bytes32 key = keys[i];
-
-            Position memory p = CORE.getPosition(key);
-            if (p.owner == address(0) || p.tokenId == 0) revert PositionNotFound();
-
-            // Only the position owner or the protocol owner (when paused in emergencies) may return the NFT.
-            if(paused()) {
-                if (!isProtocolOwner && p.owner != msg.sender) revert NotOwner();
-            } else {
-                if (p.owner != msg.sender) revert NotOwner();
-            }
-
-            uint256 feesCollectedAtStart = 0;
-            uint256 returnedUSDC = 0;
-
-            // try catch so Valuation or non-essential accounting errors can't brick emergency exit. 
-            // This is the only place where we tolerate this.
-            try CORE.getPositionDetails(key) returns (PositionDetails memory det) {
-                // Snapshot pending USDC-denominated fees at the time of return.
-                feesCollectedAtStart = det.pendingFeesUSDC;
-            } catch {
-                feesCollectedAtStart = 0;
-            }
-
-            try CORE.positionValueUSDCSingle(key) returns (uint256 returnedUSDC_) {
-                returnedUSDC = returnedUSDC_;
-            } catch { 
-                returnedUSDC = 0;
-            }
-
-            // CORE will transfer the NFT (and any tracked dust) to the owner
-            // and deregister the position.
-            CORE.returnPosition(key);
-
-            emit PositionNftReturned(p.owner, key, p.tokenId, returnedUSDC, feesCollectedAtStart);
-        }
+        CLManagerUtils.returnNft(_utilsConfig(), keys, paused(), owner());
     }
 
     /**
@@ -629,51 +751,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         whenNotPaused
         returns (uint256 usdcSent)
     {
-        slippageBps = slippageBps >= BPS ? BPS - 1 : slippageBps;
-        if (keys.length == 0) revert EmptyKeys();
-        if (keys.length > MAX_BATCH_KEYS) revert TooManyInBatch(MAX_BATCH_KEYS);
-
-        bool callerIsBot = CORE.allowedBots(msg.sender);
-        uint16 botFeeBps_ = CORE.botFeeBps();
-
-        uint256 total = 0;
-
-        for (uint256 i = 0; i < keys.length; ++i) {
-            bytes32 key = keys[i];
-
-            Position memory p = CORE.getPosition(key);
-
-            if (p.owner == address(0) || p.tokenId == 0) revert PositionNotFound();
-            _requireOwnerOrBot(p.owner, p.botAllowed, callerIsBot);
-
-            PositionDetails memory det = CORE.getPositionDetails(key);
-            uint256 remainingLossUSDC = _lossBudgetUSDC(det.pendingFeesUSDC, slippageBps);
-
-            (uint256 fee0, uint256 fee1, uint256 outUSDC, ) =
-                ICLDexAdapter(p.dex).collectFeesToUSDC(abi.encode(p.tokenId), address(USDC), remainingLossUSDC);
-
-            uint16 botFeeBpsLocal = _isZeroFee(p.owner) ? 0 : botFeeBps_;
-            uint256 netUSDC = outUSDC;
-
-            if (callerIsBot && botFeeBpsLocal > 0 && outUSDC > 0) {
-                uint256 botFeeUSDC = FullMath.mulDiv(outUSDC, botFeeBpsLocal, BPS);
-                if (botFeeUSDC > 0) {
-                    netUSDC = netUSDC > botFeeUSDC ? netUSDC - botFeeUSDC : 0;
-                    USDC.safeTransfer(msg.sender, botFeeUSDC);
-                    emit BotFeePaid(msg.sender, key, p.tokenId, botFeeUSDC, FeeType.Collect);
-                }
-            }
-
-            if (netUSDC > 0) {
-                USDC.safeTransfer(p.owner, netUSDC);
-                total = total + netUSDC;
-            }
-
-
-            emit FeesCollected(p.owner, key, p.tokenId, fee0, fee1, outUSDC);
-        }
-
-        return total;
+        return CLManagerUtils.collectFeesToUSDC(_utilsConfig(), keys, slippageBps);
     }
 
     /**
@@ -686,122 +764,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         whenNotPaused
         returns (uint256 compoundedUSDCTotal)
     {
-        slippageBps = slippageBps >= BPS ? BPS - 1 : slippageBps;
-        if (keys.length == 0) revert EmptyKeys();
-        if (keys.length > MAX_BATCH_KEYS) revert TooManyInBatch(MAX_BATCH_KEYS);
-
-        bool callerIsBot = CORE.allowedBots(msg.sender);
-        uint16 botFeeBps_ = CORE.botFeeBps();
-
-        // Fetch pending fees for the whole batch and use as pre-check to avoid wasting on-chain work.
-        PendingFeesResult[] memory pending = CORE.pendingFees(keys);
-
-        for (uint256 i = 0; i < keys.length; ++i) {
-            (uint256 compoundedUSDC) =
-                _compoundOne(keys[i], pending[i], slippageBps, callerIsBot, botFeeBps_);
-
-            compoundedUSDCTotal += compoundedUSDC;
-        }
-    }
-
-    function _compoundOne(
-        bytes32 key,
-        PendingFeesResult memory pending,
-        uint256 slippageBps,
-        bool callerIsBot,
-        uint16 botFeeBps_
-    ) internal returns (uint256 compoundedUSDCOut) {
-        if (pending.owed0 == 0 && pending.owed1 == 0) {
-            return 0;
-        }
-
-        Position memory p = CORE.getPosition(key);
-        if (p.owner == address(0) || p.tokenId == 0) revert PositionNotFound();
-        _requireOwnerOrBot(p.owner, p.botAllowed, callerIsBot);
-
-        CompoundContext memory ctx;
-        ctx.owner = p.owner;
-        ctx.tokenId = p.tokenId;
-        ctx.token0 = p.token0;
-        ctx.token1 = p.token1;
-        ctx.dex = p.dex;
-
-        (, , uint256 fee0, uint256 fee1) = ICLDexAdapter(ctx.dex).collectFeesToTokens(abi.encode(ctx.tokenId), address(this));
-        emit FeesCollected(p.owner, key, ctx.tokenId, fee0, fee1, 0);
-
-        if (fee0 == 0 && fee1 == 0) {
-            return 0;
-        }
-
-        address pool = p.pool;
-        if (pool == address(0)) revert PoolNotFound();
-        if (!CORE.isPoolAllowed(pool)) revert PoolNotAllowed();
-
-        uint16 botFeeBpsLocal = _isZeroFee(p.owner) ? 0 : botFeeBps_;
-        if (callerIsBot && botFeeBpsLocal > 0) {
-            (uint256 botPaidUSDC, uint256 remainingFee0, uint256 remainingFee1) = _handleBotFeeOnCollected(
-                ctx.dex,
-                ctx.token0,
-                ctx.token1,
-                fee0,
-                fee1,
-                botFeeBpsLocal,
-                slippageBps
-            );
-            fee0 = remainingFee0;
-            fee1 = remainingFee1;
-            if (botPaidUSDC > 0) {
-                emit BotFeePaid(msg.sender, key, ctx.tokenId, botPaidUSDC, FeeType.Compound);
-            }
-        }
-
-        if (fee0 > 0) IERC20(ctx.token0).safeTransfer(ctx.dex, fee0);
-        if (fee1 > 0) IERC20(ctx.token1).safeTransfer(ctx.dex, fee1);
-
-        RebalanceParams memory plan = PLANNER.planFromTokenBundle(
-            ctx.dex,
-            pool,
-            ctx.token0,
-            ctx.token1,
-            p.tickLower,
-            p.tickUpper,
-            fee0,
-            fee1
-        );
-
-        uint256 compoundBaseUSDC = _tokenValueUSDC(ctx.dex, ctx.token0, fee0) + _tokenValueUSDC(ctx.dex, ctx.token1, fee1);
-        uint256 remainingLossUSDC = _lossBudgetUSDC(compoundBaseUSDC, slippageBps);
-
-        (uint256 used0, uint256 used1, uint256 leftoverUSDC, uint256 remainingLossUSDCFinal) =
-            ICLDexAdapter(ctx.dex).addLiquidity(
-                abi.encode(ctx.tokenId),
-                address(USDC),
-                fee0,
-                fee1,
-                plan,
-                remainingLossUSDC
-            );
-
-        uint256 compoundedUSDC = _tokenValueUSDC(ctx.dex, ctx.token0, used0) + _tokenValueUSDC(ctx.dex, ctx.token1, used1);
-
-        leftoverUSDC = _maybeSecondPass(
-            ctx.dex,
-            pool,
-            ctx.token0,
-            ctx.token1,
-            p.tickLower,
-            p.tickUpper,
-            ctx.tokenId,
-            leftoverUSDC,
-            p.totalDepositedUSDC,
-            remainingLossUSDCFinal
-        );
-
-        compoundedUSDC += leftoverUSDC;
-        _addDust(key, leftoverUSDC);
-
-        emit FeesCompounded(p.owner, key, ctx.tokenId, compoundedUSDC, used0, used1);
-        return compoundedUSDC;
+        return CLManagerUtils.compoundFees(_utilsConfig(), keys, slippageBps);
     }
 
     /**
@@ -825,15 +788,15 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         // Snapshot canonical position value before any changes
         uint256 positionValueBefore = _corePositionValue(key);
 
-        (uint16 protocolFeeBps_, address reserve) = _protocolFeeConfig();
-        if (_isZeroFee(p.owner)) {
-            protocolFeeBps_ = 0;
-        }
+        address effectiveUser = p.owner == address(EZ_WRAPPER) ? EZ_WRAPPER.userForKey(key) : p.owner;
+        (uint16 protocolFeeBps_, address reserve) = _discountedProtocolFeeConfig(p.owner, 0);
+        if (address(REFERRAL_MANAGER) == address(0)) revert ReferralManagerNotSet();
+        ReferralInfo memory resolvedReferrer;
+        resolvedReferrer.referrer = REFERRAL_MANAGER.storeReferrer(effectiveUser, address(0));
 
         uint256 add = usdcAmount;
-        uint256 baseUSDC = p.totalDepositedUSDC + usdcAmount;
-        uint256 protocolFeeUSDC = _protocolFeeAmount(add, protocolFeeBps_);
-        uint256 net = add - protocolFeeUSDC;
+        (uint256 protocolFeeUSDC,, uint256 net) =
+            _depositFees(add, protocolFeeBps_, resolvedReferrer);
 
         // Pull USDC from the owner
         USDC.safeTransferFrom(p.owner, address(this), add);
@@ -842,7 +805,6 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
             USDC.safeTransfer(reserve, protocolFeeUSDC);
             emit ProtocolFeePaid(p.owner, key, p.tokenId, add, protocolFeeUSDC, net, FeeType.CollateralAdd);
         }
-
         address pool = p.pool;
         if (pool == address(0)) revert PoolNotFound();
         if (!CORE.isPoolAllowed(pool)) revert PoolNotAllowed();
@@ -871,26 +833,13 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
             amount1In
         );
 
-        (, , uint256 leftoverAdd, uint256 remainingLossUSDCFinal) = ICLDexAdapter(p.dex).addLiquidity(
+        (, , uint256 leftoverAdd, ) = ICLDexAdapter(p.dex).addLiquidity(
             abi.encode(p.tokenId),
             address(USDC),
             amount0In,
             amount1In,
             plan,
             remainingLossUSDCOut
-        );
-
-        leftoverAdd = _maybeSecondPass(
-            p.dex,
-            pool,
-            p.token0,
-            p.token1,
-            p.tickLower,
-            p.tickUpper,
-            p.tokenId,
-            leftoverAdd,
-            baseUSDC,
-            remainingLossUSDCFinal
         );
 
         // Track any residual USDC from add-liquidity attempts as per-position dust.
@@ -907,7 +856,16 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
             ? positionValueAfter - positionValueBefore
             : 0;
 
-        emit CollateralAdded(p.owner, key, p.tokenId, depositedUSDC, addedUSDC, positionValueAfter, protocolFeeUSDC);
+        emit CollateralAdded(
+            p.owner,
+            key,
+            p.tokenId,
+            depositedUSDC,
+            addedUSDC,
+            positionValueAfter,
+            protocolFeeUSDC,
+            resolvedReferrer.referrer
+        );
 
     }
 
@@ -925,129 +883,12 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         onlyKeyOwner(key)
         whenNotPaused
     {
-        slippageBps = slippageBps >= BPS ? BPS - 1 : slippageBps;
-        if (withdrawUSDC == 0) revert ZeroAmount();
-
-        Position memory p = CORE.getPosition(key);
-
-        uint256 positionValueInitial = _corePositionValue(key);
-        uint256 positionValueExcludingDust = positionValueInitial - p.dustUSDC;
-
-        if (positionValueInitial == 0) revert PositionValueZero();
-
-        uint256 remainingTarget = withdrawUSDC;
-        uint256 totalReturned = 0;
-        uint256 feesCollected = 0;
-
-        // 1. Use tracked dust first, possibly satisfying the full request.
-        if (p.dustUSDC > 0) {
-            uint256 dustToWithdraw = remainingTarget < p.dustUSDC ? remainingTarget : p.dustUSDC;
-            if (dustToWithdraw > 0) {
-                uint256 dustWithdrawn = CORE.withdrawDustForPosition(key, address(this), dustToWithdraw);
-                if (dustWithdrawn > 0) {
-                    remainingTarget -= dustWithdrawn;
-                    totalReturned += dustWithdrawn; // to be transferred once at the end
-                }
-            }
-        }
-
-        // If dust covered the full request, emit event and stop.
-        if (remainingTarget == 0) {
-            p = CORE.getPosition(key);
-            uint256 positionValueAfterDust = _corePositionValue(key);
-            // No on-chain fee collection happened during dust-only withdraws.
-            feesCollected = 0;
-            // removedUSDC should represent the decrease in totalDepositedUSDC/position value.
-            // which is exactly the dust amount we withdrew and already adjusted above.
-            uint256 removedUSDC = totalReturned;
-            CORE.adjustTotalDeposited(key, -int256(totalReturned));
-            USDC.safeTransfer(p.owner, totalReturned);
-            emit CollateralRemoved(p.owner, key, p.tokenId, totalReturned, feesCollected, removedUSDC, positionValueAfterDust);
-            return;
-        }
-
-        // 2. Dust was insufficient; remove liquidity for the remainder.
-
-        // Use live quoted value strictly for computing withdrawal BPS for accuracy.
-        uint256 quotedPositionValueBefore = _quotedPositionValue(key, p);
-
-        // If quoted value fails (returns 0), fall back to on-chain valuation minus dust.
-        if (quotedPositionValueBefore == 0) {
-            quotedPositionValueBefore = positionValueExcludingDust;
-        }
-
-        if (quotedPositionValueBefore == 0) revert PositionValueZero();
-
-        // Prevent withdrawing so much that the remaining position (excluding dust)
-        // would fall below the protocol minimum open threshold.
-        uint256 remainingAfter = quotedPositionValueBefore > remainingTarget
-            ? quotedPositionValueBefore - remainingTarget
-            : 0;
-        if (remainingAfter < MINIMUM_OPEN_USDC) revert TooMuchWithdraw();
-
-        uint256 withdrawFraction = FullMath.mulDiv(
-            remainingTarget,
-            LIQUIDITY_PERCENTAGE_PRECISION,
-            quotedPositionValueBefore
-        );
-
-        if (withdrawFraction == 0) revert BpsZero();
-        if (withdrawFraction >= LIQUIDITY_PERCENTAGE_PRECISION) {
-            withdrawFraction = LIQUIDITY_PERCENTAGE_PRECISION - 1;
-        }
-
-        // If there are tokens already in tokensOwed, they get automatically collected on decreaseLiquidity.
-        // For proper accounting, we need to log them as feesCollected.
-        // Snapshot pending fees before liquidity change to compute collected fees.
-        PositionDetails memory detBefore = CORE.getPositionDetails(key);
-
-        uint256 remainingLossUSDC = _lossBudgetUSDC(remainingTarget, slippageBps);
-        uint256 usdcOut = ICLDexAdapter(p.dex).removeLiquidityBpsUSDC(
-            abi.encode(p.tokenId),
-            withdrawFraction,
-            address(USDC),
-            address(this),
-            remainingLossUSDC
-        );
-        if (usdcOut == 0) revert NothingRemoved();
-
-        totalReturned += usdcOut;
-        USDC.safeTransfer(p.owner, totalReturned);
-        
-        uint256 positionValueAfter = _corePositionValue(key);
-
-        // `positionValueInitial` was taken before we withdrew any tracked dust above.
-        // After withdrawing dust (and then burning liquidity for the remaining target),
-        // the observed decrease in canonical position value (`positionValueInitial - positionValueAfter`)
-        // naturally includes both the dust withdrawn earlier and the value removed via liquidity burn.
-        // We therefore decrement `totalDepositedUSDC` by this single `deltaValue` to avoid
-        // double-adjusting (i.e. avoid separately subtracting dust and the burn delta).
-        uint256 deltaValue =
-            positionValueInitial > positionValueAfter
-                ? positionValueInitial - positionValueAfter
-                : 0;
-        if (deltaValue > 0) {
-            CORE.adjustTotalDeposited(key, -int256(deltaValue));
-        }
-
-        // Snapshot pending fees after liquidity change and compute fees collected to manager in USDC.
-        PositionDetails memory detAfter = CORE.getPositionDetails(key);
-        feesCollected = 0;
-        if (detAfter.pendingFeesUSDC > detBefore.pendingFeesUSDC) {
-            // This should not normally happen, but guard against underflow.
-            feesCollected = 0;
-        } else {
-            feesCollected = detBefore.pendingFeesUSDC > detAfter.pendingFeesUSDC
-                ? detBefore.pendingFeesUSDC - detAfter.pendingFeesUSDC
-                : 0;
-        }
-
-        emit CollateralRemoved(p.owner, key, p.tokenId, totalReturned, feesCollected, deltaValue, positionValueAfter);
+        CLManagerUtils.removeCollateral(_utilsConfig(), key, withdrawUSDC, slippageBps);
     }
 
     /**
      * @notice Change the tick range of an existing position by fully unwinding and re-minting.
-     * @dev Owner calls pay protocol fee to reserve; bots additionally pay bot fee to caller bot. 
+     * @dev Rebalances charge protocol fees only on pending fees moved into the new range; bots additionally pay bot fee to caller bot.
      * totalDepositedUSDC is unchanged.
      */
     function changeRange(
@@ -1061,170 +902,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         onlyKeyOwnerOrBot(key)
         whenNotPaused
     {
-        slippageBps = slippageBps >= BPS ? BPS - 1 : slippageBps;
-        if (newTickLower >= newTickUpper) revert InvalidTickRange();
-
-        Position memory p = CORE.getPosition(key);
-        uint256 baseUSDC = p.totalDepositedUSDC;
-
-        // Use CORE's on-chain computed pending USDC for the position.
-        PositionDetails memory det = CORE.getPositionDetails(key);
-        uint256 feesCollectedAtStart = det.pendingFeesUSDC;
-
-        // Validate new ticks align with stored spacing.
-        if ((newTickLower % p.tickSpacing) != 0 || (newTickUpper % p.tickSpacing) != 0) revert InvalidTickRange();
-        if (newTickLower < -887272 || newTickUpper > 887272) revert InvalidTickRange();
-
-        bool callerIsBot = CORE.allowedBots(msg.sender);
-        uint16 botFeeBps_ = CORE.botFeeBps();
-        bool zeroFeeOwner = _isZeroFee(p.owner);
-
-        // Snapshot position value before any operations.
-        uint256 positionValueBefore = _corePositionValue(key);
-
-        // Fully unwind the old NFT into underlying tokens.
-        (address[] memory toks, uint256[] memory amts) =
-            ICLDexAdapter(p.dex).unwindToTokens(abi.encode(p.tokenId), address(this));
-
-        uint256 bal0 = 0;
-        uint256 bal1 = 0;
-        for (uint256 idx = 0; idx < toks.length; ++idx) {
-            if (toks[idx] == p.token0) {
-                bal0 += amts[idx];
-            } else if (toks[idx] == p.token1) {
-                bal1 += amts[idx];
-            }
-        }
-
-        if (bal0 == 0 && bal1 == 0) revert NoTokensUnwound();
-
-        address pool = p.pool;
-        if (pool == address(0)) revert PoolNotFound();
-        if (!CORE.isPoolAllowed(pool)) revert PoolNotAllowed();
-
-        // From the unwound tokens, determine optimal swap amounts for the new range.
-        RebalanceParams memory plan = PLANNER.planFromTokenBundle(
-            p.dex,
-            pool,
-            p.token0,
-            p.token1,
-            newTickLower,
-            newTickUpper,
-            bal0,
-            bal1
-        );
-
-        // Transfer the exact unwound token amounts to adapter for minting.
-        // Mint new NFT in the requested range using the unwound tokens only.
-        if (bal0 > 0) IERC20(p.token0).safeTransfer(p.dex, bal0);
-        if (bal1 > 0) IERC20(p.token1).safeTransfer(p.dex, bal1);
-        uint256 changeBaseUSDC = _tokenValueUSDC(p.dex, p.token0, bal0) + _tokenValueUSDC(p.dex, p.token1, bal1);
-        uint256 remainingLossUSDC = _lossBudgetUSDC(changeBaseUSDC, slippageBps);
-
-        (uint256 newTokenId, , , uint256 leftoverUSDC, uint256 remainingLossUSDCFinal) = ICLDexAdapter(p.dex).mintPosition(
-            p.token0,
-            p.token1,
-            address(USDC),
-            p.fee,
-            p.tickSpacing,
-            newTickLower,
-            newTickUpper,
-            address(CORE),
-            bal0,
-            bal1,
-            plan,
-            remainingLossUSDC
-        );
-
-        if (newTokenId == 0) revert NoPositionMinted();
-
-        leftoverUSDC = _maybeSecondPass(
-            p.dex,
-            pool,
-            p.token0,
-            p.token1,
-            newTickLower,
-            newTickUpper,
-            newTokenId,
-            leftoverUSDC,
-            baseUSDC,
-            remainingLossUSDCFinal
-        );
-
-        CORE.updateTokenMetadata(key, newTokenId, newTickLower, newTickUpper);
-
-        uint256 botFeeUSDC = 0;
-        uint256 protocolFeeUSDC = 0;
-
-        (uint16 protocolFeeBpsLocal, address reserve) = _protocolFeeConfig();
-        if (zeroFeeOwner) {
-            protocolFeeBpsLocal = 0;
-        }
-        uint16 botFeeBpsLocal = callerIsBot && !zeroFeeOwner ? botFeeBps_ : 0;
-        uint16 totalFeeBps = protocolFeeBpsLocal + botFeeBpsLocal;
-
-        if (totalFeeBps > 0) {
-            // Protocol/bot fee conversions are outside the user budget model, but should use
-            // the caller's full slippage tolerance. Derive a USDC loss budget for the expected
-            // notional being removed.
-            uint256 positionValueForFee = _corePositionValue(key);
-            uint256 feeBaseUSDC = FullMath.mulDiv(positionValueForFee, totalFeeBps, BPS);
-            uint256 feeLossBudgetUSDC = _lossBudgetUSDC(feeBaseUSDC, slippageBps);
-
-            uint256 feeFractionTotal = uint256(totalFeeBps) * 1e14; // bps -> 18-dec fraction
-            uint256 totalFeeUSDC = ICLDexAdapter(p.dex).removeLiquidityBpsUSDC(
-                abi.encode(newTokenId),
-                feeFractionTotal,
-                address(USDC),
-                address(this),
-                feeLossBudgetUSDC
-            );
-
-            if (totalFeeUSDC > 0) {
-                if (protocolFeeBpsLocal > 0) {
-                    protocolFeeUSDC = FullMath.mulDiv(totalFeeUSDC, protocolFeeBpsLocal, totalFeeBps);
-                    if (protocolFeeUSDC > 0) {
-                        USDC.safeTransfer(reserve, protocolFeeUSDC);
-                        emit ProtocolFeePaid(
-                            p.owner,
-                            key,
-                            newTokenId,
-                            totalFeeUSDC,
-                            protocolFeeUSDC,
-                            totalFeeUSDC > protocolFeeUSDC ? totalFeeUSDC - protocolFeeUSDC : 0,
-                            FeeType.ChangeRange
-                        );
-                    }
-                }
-
-                botFeeUSDC = totalFeeUSDC > protocolFeeUSDC ? totalFeeUSDC - protocolFeeUSDC : 0;
-                if (botFeeUSDC > 0 && botFeeBpsLocal > 0) {
-                    USDC.safeTransfer(msg.sender, botFeeUSDC);
-                    emit BotFeePaid(msg.sender, key, newTokenId, botFeeUSDC, FeeType.ChangeRange);
-                }
-            }
-        }
-
-        // Track mint leftover USDC as dust on the position.
-        _addDust(key, leftoverUSDC);
-
-        // Snapshot position value after fees and dust tracking.
-        uint256 positionValueAfter = _corePositionValue(key);
-
-        emit RangeChanged(
-            p.owner,
-            key,
-            p.tokenId,
-            newTokenId,
-            p.tickLower,
-            p.tickUpper,
-            newTickLower,
-            newTickUpper,
-            positionValueBefore,
-            positionValueAfter,
-            protocolFeeUSDC,
-            feesCollectedAtStart
-        );
+        CLManagerUtils.changeRange(_utilsConfig(), key, newTickLower, newTickUpper, slippageBps);
     }
 
     /**
@@ -1237,7 +915,7 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
 
     /**
      * @notice Withdraw tracked dust (USDC) for a position and send to the owner.
-     * @dev Decrements `totalDepositedUSDC` by the withdrawn dust amount.
+     * @dev Decrements `totalDepositedUSDC` by the withdrawn dust amount, capped at current deposited accounting.
      */
     function withdrawDust(bytes32 key) external nonReentrant onlyKeyOwner(key) whenNotPaused {
         Position memory p = CORE.getPosition(key);
@@ -1246,8 +924,12 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         uint256 dust = CORE.withdrawDustForPosition(key, address(this), type(uint256).max);
         if (dust == 0) revert ZeroAmount();
 
-        // Decrease totalDepositedUSDC by the withdrawn amount
-        CORE.adjustTotalDeposited(key, -int256(dust));
+        uint256 depositedDebit = dust < p.totalDepositedUSDC ? dust : p.totalDepositedUSDC;
+
+        // Decrease totalDepositedUSDC by the deposited amount represented by the withdrawal.
+        if (depositedDebit > 0) {
+            CORE.adjustTotalDeposited(key, -int256(depositedDebit));
+        }
 
         // Transfer USDC to the position owner
         USDC.safeTransfer(p.owner, dust);
@@ -1261,62 +943,100 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         CORE.addDustToPosition(key, amount);
     }
 
-    /// @dev Live position value using adapter quoter-based routing (includes owed fees).
-    function _quotedPositionValue(bytes32 key, Position memory p)
-        internal
-        view
-        returns (uint256 valueExcludingDust)
-    {
-        if (p.tokenId == 0 || p.dex == address(0)) {
-            return 0;
-        }
-
-        (uint256 amt0, uint256 amt1, uint128 owed0, uint128 owed1) = CORE.spotAmounts(key);
-
-        address token0 = p.token0;
-        address token1 = p.token1;
-
-        uint256 total0 = amt0 + uint256(owed0);
-        uint256 total1 = amt1 + uint256(owed1);
-
-        uint256 value0 = 0;
-        if (total0 > 0) {
-            value0 = ICLDexAdapter(p.dex).getExpectedOutUSDC(token0, total0, address(USDC));
-        }
-        
-        uint256 value1 = 0;
-        if (total1 > 0) {
-            value1 = ICLDexAdapter(p.dex).getExpectedOutUSDC(token1, total1, address(USDC));
-        }
-
-        valueExcludingDust = value0 + value1;
-    }
-
     function _corePositionValue(bytes32 key) internal view returns (uint256) {
-        // Use a single-key accessor on CORE to avoid allocating small arrays
-        // and to reduce external call overhead for common single-key paths.
         return CORE.positionValueUSDCSingle(key);
     }
 
-    function _tokenValueUSDC(address dex, address token, uint256 amount) internal view returns (uint256) {
-        if (amount == 0) return 0;
-        if (token == address(USDC)) return amount;
-        uint256 value = VALUATION.usdcValue(dex, token, amount);
-        return value;
+    function _resolveDexForPool(address pool)
+        internal
+        view
+        returns (address dex, address token0, address token1, uint24 fee, int24 tickSpacing)
+    {
+        address[] memory dexes = CORE.listAllowedDexes();
+        for (uint256 i = 0; i < dexes.length; ++i) {
+            address tryDex = dexes[i];
+            if (tryDex == address(0)) continue;
+            try ICLDexAdapter(tryDex).validateAndGetPoolParams(pool) returns (address t0, address t1, uint24 f, int24 ts) {
+                dex = tryDex;
+                token0 = t0;
+                token1 = t1;
+                fee = f;
+                tickSpacing = ts;
+                break;
+            } catch {}
+        }
+        if (dex == address(0)) revert DexNotAllowed();
+        if (!CORE.isPoolAllowed(pool)) revert PoolNotAllowed();
+        if (CORE.isPoolDeprecated(pool)) revert PoolDeprecated();
     }
 
-    function _isZeroFee(address owner) internal view returns (bool) {
-        return CORE.zeroFeeWallets(owner);
+    function _requirePoolInitialized(address pool) internal view {
+        (bool ok, bytes memory data) = pool.staticcall(abi.encodeWithSignature("slot0()"));
+        if (!ok || data.length < 32) revert PoolNotInitialized();
+        (uint256 w0) = abi.decode(data, (uint256));
+        if (uint160(w0) == 0) revert PoolNotInitialized();
     }
 
-    function _protocolFeeConfig() internal view returns (uint16 bps, address reserve) {
+    function _discountedProtocolFeeConfig(address wallet, uint16 extraDiscountBps)
+        internal
+        view
+        returns (uint16 bps, address reserve)
+    {
         bps = CORE.protocolFeeBps();
         reserve = CORE.protocolReserve();
         if (bps > 0 && reserve == address(0)) revert ReserveNotSet();
+        uint16 discountBps = discountedFeeWallets[wallet];
+        if (extraDiscountBps != 0) {
+            discountBps = discountBps + extraDiscountBps > BPS ? uint16(BPS) : discountBps + extraDiscountBps;
+        }
+        if (discountBps != 0) {
+            bps = bps - uint16(FullMath.mulDiv(bps, discountBps, BPS));
+        }
     }
 
     function _protocolFeeAmount(uint256 amount, uint16 bps) internal pure returns (uint256) {
         return bps == 0 ? 0 : FullMath.mulDiv(amount, bps, BPS);
+    }
+
+    function _storeReferrer(address user, address referrer) internal returns (address resolvedReferrer) {
+        if (address(REFERRAL_MANAGER) == address(0)) revert ReferralManagerNotSet();
+        resolvedReferrer = REFERRAL_MANAGER.storeReferrer(user, referrer);
+    }
+
+    function _resolveDepositReferrer(address user, address referrer)
+        internal
+        returns (ReferralInfo memory info)
+    {
+        if (address(REFERRAL_MANAGER) == address(0)) revert ReferralManagerNotSet();
+        info.referrer = REFERRAL_MANAGER.storeReferrer(user, referrer);
+    }
+
+    function _depositFees(uint256 amount, uint16 protocolFeeBps_, ReferralInfo memory referral)
+        internal
+        pure
+        returns (uint256 protocolFeeUSDC, uint256 referralFeeUSDC, uint256 netUSDC)
+    {
+        uint256 totalFeeUSDC = _protocolFeeAmount(amount, protocolFeeBps_);
+        referralFeeUSDC =
+            referral.referrer == address(0) ? 0 : _protocolFeeAmount(totalFeeUSDC, referral.shareBps);
+        protocolFeeUSDC = totalFeeUSDC;
+        netUSDC = amount - totalFeeUSDC;
+    }
+
+    function _payReferralFee(
+        address referrer,
+        address user,
+        bytes32 key,
+        uint256 grossUSDC,
+        uint256 referralFeeUSDC,
+        uint256 netUSDC,
+        FeeType feeType
+    ) internal {
+        if (referralFeeUSDC > 0) {
+            USDC.safeTransfer(address(REFERRAL_MANAGER), referralFeeUSDC);
+        }
+        REFERRAL_MANAGER.creditReferralFee(referrer, user, key, grossUSDC, referralFeeUSDC, netUSDC, uint8(feeType));
+        emit ReferralFeePaid(referrer, user, key, grossUSDC, referralFeeUSDC, netUSDC, feeType);
     }
 
     function _lossBudgetUSDC(uint256 baseUSDC, uint256 slippageBps) internal pure returns (uint256 remainingLossUSDC) {
@@ -1326,140 +1046,4 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
         return FullMath.mulDivRoundingUp(baseUSDC, sl, BPS);
     }
 
-    function _maybeSecondPass(
-        address dex,
-        address pool,
-        address token0,
-        address token1,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 tokenId,
-        uint256 leftoverUSDC,
-        uint256 baseUSDC,
-        uint256 remainingLossUSDC
-    ) internal returns (uint256) {
-        if (leftoverUSDC == 0 || tokenId == 0 || baseUSDC == 0 || remainingLossUSDC == 0) {
-            return leftoverUSDC;
-        }
-
-        uint256 leftoverRatioBps = FullMath.mulDiv(leftoverUSDC, BPS, baseUSDC);
-        // If leftover is <= SECOND_PASS_THRESHOLD_BPS of base OR less than $0.001, skip second pass.
-        if (leftoverRatioBps <= SECOND_PASS_THRESHOLD_BPS || leftoverUSDC < SECOND_PASS_MIN_USDC) {
-            return leftoverUSDC;
-        }
-
-        if (leftoverUSDC > 0) {
-            USDC.safeTransfer(dex, leftoverUSDC);
-        }
-
-        (uint256 amount0In, uint256 amount1In, uint256 remainingLossUSDCOut) = ICLDexAdapter(dex).seedPairFromUSDC(
-            address(USDC),
-            token0,
-            token1,
-            leftoverUSDC,
-            remainingLossUSDC
-        );
-
-        if (amount0In == 0 && amount1In == 0) {
-            return leftoverUSDC;
-        }
-
-        RebalanceParams memory plan = PLANNER.planFromTokenBundle(
-            dex,
-            pool,
-            token0,
-            token1,
-            tickLower,
-            tickUpper,
-            amount0In,
-            amount1In
-        );
-        (, , uint256 newLeftoverUSDC, ) = ICLDexAdapter(dex).addLiquidity(
-            abi.encode(tokenId),
-            address(USDC),
-            amount0In,
-            amount1In,
-            plan,
-            remainingLossUSDCOut
-        );
-
-        return newLeftoverUSDC;
-    }
-
-    /// @dev Handles selling collected fee tokens to pay bot fee and returns (paidUSDC, remainingFee0, remainingFee1)
-    function _handleBotFeeOnCollected(
-        address dex,
-        address token0,
-        address token1,
-        uint256 fee0,
-        uint256 fee1,
-        uint16 botFeeBpsLocal,
-        uint256 slippageBps
-    ) internal returns (uint256 paidUSDC, uint256 remainingFee0, uint256 remainingFee1) {
-        paidUSDC = 0;
-        remainingFee0 = fee0;
-        remainingFee1 = fee1;
-
-        // Compute USDC-equivalent of fees we collected
-        uint256 val0 = _tokenValueUSDC(dex, token0, fee0);
-        uint256 val1 = _tokenValueUSDC(dex, token1, fee1);
-        uint256 initialUSDCIn = val0 + val1;
-        if (initialUSDCIn == 0) return (0, remainingFee0, remainingFee1);
-
-        uint256 targetFeeUSDC = FullMath.mulDiv(initialUSDCIn, botFeeBpsLocal, BPS);
-
-        uint256 sell0 = 0;
-        uint256 sell1 = 0;
-
-        // Prefer selling from token0 first; if insufficient, use token1.
-        if (val0 >= targetFeeUSDC) {
-            sell0 = FullMath.mulDiv(fee0, targetFeeUSDC, val0);
-        } else {
-            sell0 = fee0;
-            uint256 remainingUSDC = targetFeeUSDC > val0 ? targetFeeUSDC - val0 : 0;
-            if (remainingUSDC > 0 && val1 > 0) {
-                sell1 = FullMath.mulDiv(fee1, remainingUSDC, val1);
-            }
-        }
-
-        if (sell0 > fee0) sell0 = fee0;
-        if (sell1 > fee1) sell1 = fee1;
-
-        // Protocol/bot fee conversions are outside the user budget model, but still need a
-        // slippage tolerance to avoid unnecessary reverts. Derive a fresh USDC loss budget
-        // from the expected notional being swapped and apply it sequentially.
-        uint256 expectedSellUSDC = 0;
-        if (sell0 > 0 && fee0 > 0) expectedSellUSDC += FullMath.mulDivRoundingUp(val0, sell0, fee0);
-        if (sell1 > 0 && fee1 > 0) expectedSellUSDC += FullMath.mulDivRoundingUp(val1, sell1, fee1);
-        uint256 remainingLossUSDC = _lossBudgetUSDC(expectedSellUSDC, slippageBps);
-
-        if (sell0 > 0) {
-            IERC20(token0).safeTransfer(dex, sell0);
-            (uint256 outUSDC, uint256 remainingLossUSDCOut) = ICLDexAdapter(dex).swapExactInToUSDC(
-                token0,
-                sell0,
-                address(USDC),
-                msg.sender,
-                remainingLossUSDC
-            );
-            paidUSDC += outUSDC;
-            remainingFee0 = remainingFee0 > sell0 ? remainingFee0 - sell0 : 0;
-            remainingLossUSDC = remainingLossUSDCOut;
-        }
-
-        if (sell1 > 0) {
-            IERC20(token1).safeTransfer(dex, sell1);
-            (uint256 outUSDC,) = ICLDexAdapter(dex).swapExactInToUSDC(
-                token1,
-                sell1,
-                address(USDC),
-                msg.sender,
-                remainingLossUSDC
-            );
-            paidUSDC += outUSDC;
-            remainingFee1 = remainingFee1 > sell1 ? remainingFee1 - sell1 : 0;
-        }
-
-        return (paidUSDC, remainingFee0, remainingFee1);
-    }
 }
