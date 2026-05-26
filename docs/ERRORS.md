@@ -20,7 +20,7 @@ This reference lists the custom `error` declarations present in the `src/` Solid
 - `TickAlignmentError()` : Tick range not aligned to tick spacing.
 - `InvalidFee()` : Fee value invalid for pool (sentinel).
 - `InsufficientCoreBalance()` : CORE does not hold required USDC (push-model enforced).
-- `ReserveNotSet()` : Protocol reserve not set while protocolFeeBps > 0.
+- `ReserveNotSet()` : A protocol-fee-paying path required ProtocolReserve, but no reserve address was configured.
 - `ArithmeticOverflow()` : Generic arithmetic safety sentinel (e.g. adjustTotalDeposited inputs).
 - `PoolNotFound()` : Pool lookup failed for given tokens/fee/spacing.
 - `PoolNotAllowed()` : Pool not tracked or explicitly revoked in CORE (NotAllowed).
@@ -36,11 +36,12 @@ This reference lists the custom `error` declarations present in the `src/` Solid
 ## CLManager (src/CLManager.sol)
 
 - `NotGuardian()` : Caller is not the guardian.
+- `NotEZWrapper()` : Caller is not the configured EZWrapper.
 - `NotOwner()` : Caller is not the position owner (or allowed bot for some flows).
 - `UsdcDecimalsTooLow()` : USDC has fewer than 3 decimals in constructor (unsupported).
 - `InvalidParams()` : Generic invalid parameters sentinel in manager.
 - `PositionNotFound()` : Position registry lookup failed.
-- `ReserveNotSet()` : Protocol reserve not configured.
+- `ReserveNotSet()` : A protocol-fee-paying path required ProtocolReserve, but no reserve address was configured.
 - `NothingRemoved()` : No liquidity was removed during an exit or change range.
 - `TooManyInBatch(uint256 maxKeys)` : Batch input exceeded `MAX_BATCH_KEYS`.
 - `PositionValueZero()` : Position value computed as zero (disallowed in some flows).
@@ -55,10 +56,36 @@ This reference lists the custom `error` declarations present in the `src/` Solid
 - `ZeroAmount()` : Zero amount where positive amount expected.
 - `PositionTooSmall()` : Position size below `MINIMUM_OPEN_USDC`.
 - `InvalidTickRange()` : Provided tick range invalid.
+- `RangeUnchanged()` : `changeRange` was called with the position's current tick range.
 - `EmptyKeys()` : Keys array is empty where non-empty required.
 - `ZeroAddress()` : Zero address provided.
 - `TickAlignmentError()` : Tick alignment mismatch for provided spacing.
 - `PoolNotInitialized()` : Pool is uninitialized (`slot0.sqrtPriceX96 == 0`), so minting is unsafe.
+- `InvalidReferrer()` : Referrer is invalid for the wallet/action being processed.
+- `AlreadySet()` : One-time setter, such as `setEZWrapper`, was called more than once.
+- `ReferralManagerNotSet()` : ReferralManager is required but has not been configured.
+- `OwnershipRenounceDisabled()` : `renounceOwnership` is disabled for this owner-managed contract.
+
+## EZWrapper (src/EZWrapper.sol)
+
+- `ZeroAddress()` : Zero address provided where non-zero is required, or copied source position is invalid.
+- `NotGuardian()` : Caller is not the set guardian.
+- `ZeroAmount()` : Zero amount where a positive amount is expected.
+- `NotPositionUser()` : Caller is not mapped to the wrapper-owned position key.
+- `NotManager()` : Caller is not the configured CLCore manager when crediting direct bot action proceeds.
+- `NotCore()` : NFT receiver callback was not for an NFT returned from CLCore.
+- `InvalidReturnedNft()` : Returned NFT forwarding data is invalid.
+- `OwnershipRenounceDisabled()` : `renounceOwnership` is disabled for this owner-managed contract.
+
+## ReferralManager (src/ReferralManager.sol)
+
+- `ZeroAddress()` : Zero address provided where non-zero is required.
+- `NotGuardian()` : Caller is not the set guardian.
+- `NotManager()` : Caller is not the configured manager.
+- `ZeroAmount()` : Zero amount where positive amount is expected.
+- `FeeTooHigh()` : Referral share or copy referral share exceeds the configured cap.
+- `InvalidReferrer()` : No valid referrer could be resolved, usually because default-referrer fallback is unset or invalid; also used by strict caller-level referrer guards.
+- `OwnershipRenounceDisabled()` : `renounceOwnership` is disabled for this owner-managed contract.
 
 ## Adapters
 
@@ -97,15 +124,6 @@ This reference lists the custom `error` declarations present in the `src/` Solid
 - `NPMPositionsError()` : NPM.positions() lookup failed.
 - `BalanceTooLow()` : Adapter does not hold the required token balance for the requested action.
 - `UnsupportedPair()` : Pair cannot be seeded/routed under the adapter’s bridge-token constraints.
-
-## ProtocolReserve (src/ProtocolReserve.sol)
-
-- `LengthMismatch()` : Recipient and percentage arrays length mismatch in `setShares`.
-- `InvalidRecipientAddress()` : Zero-address recipient provided.
-- `TotalNot100()` : Sum of percentages must equal 10000 (100%).
-- `NoBalance()` : Attempt to sweep when reserve balance is zero.
-- `NoShares()` : Attempt to sweep when no shares configured.
-- `EmptyShares()` : Attempt to set empty shares array.
 
 ## Valuation (src/Valuation.sol)
 

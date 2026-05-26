@@ -11,6 +11,7 @@ This document outlines the protocol's response procedures in the event of a crit
   - Even while the protocol is paused, users can withdraw their position NFTs (and any tracked dust) using the `returnNft(bytes32[] calldata keys)` function in `CLManager.sol`.
   - This function is always available, even when the protocol is paused, ensuring users can reclaim their assets at any time.
   - This function uses try/catch for any calls that interact with Valuation or non-essential accounting flows (pending fee/value snapshots), so valuation failures cannot brick NFT recovery.
+  - `returnNft` is intentionally a fee-free custody exit. It does not collect pending LP fees or charge the earned-fee protocol fee before returning the NFT; after return, any fee collection occurs directly through the underlying position manager outside CLManager accounting.
   - `CLCore.returnPosition` transfers the NFT back to the owner using `safeTransferFrom`; if the owner is a contract, it must implement `IERC721Receiver` to receive the NFT.
 
 ### 3. Multisig/Timelock Emergency Powers

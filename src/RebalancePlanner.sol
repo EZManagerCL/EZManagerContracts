@@ -3,137 +3,180 @@ pragma solidity ^0.8.24;
 
 import {IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
+import {BitMath} from "@uniswap/v3-core/contracts/libraries/BitMath.sol";
 import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 import {FixedPoint96} from "@uniswap/v3-core/contracts/libraries/FixedPoint96.sol";
 import {SqrtPriceMath} from "@uniswap/v3-core/contracts/libraries/SqrtPriceMath.sol";
+import {SwapMath} from "@uniswap/v3-core/contracts/libraries/SwapMath.sol";
+import {LiquidityAmounts} from "@uniswap/v3-periphery/contracts/libraries/LiquidityAmounts.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
-import {ICLDexAdapter, RebalanceParams, Position, RegisterParams, PositionValueResult, PendingFeesResult, PositionDetails, ICLCore, IValuation, ICLPool, IAerodromeFactory, IUniswapV3Factory, IUniswapV3Pool, ISlipstreamPoolState, INonfungiblePositionManager} from "./Interfaces.sol";
-
-/*────────────────────────────── External Interfaces ─────────────────────────────*/
-
-/*────────────────────────────────── Contract ───────────────────────────────────*/
+import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
+import {
+    ICLDexAdapter,
+    RebalanceParams,
+    ICLCore,
+    IAerodromeFactory,
+    IUniswapV3Pool,
+    ISlipstreamPoolState
+} from "./Interfaces.sol";
 
 /**
  * @title RebalancePlanner
- * @notice Computes optimal swap amounts using Iterative Value Decomposition (Newton's Method).
- * @dev    Achieves <0.01% dust precision using a damped Newton solver.
- * Robust against "slot0" interface differences between UniV3 and Aerodrome.
+ * @notice Computes optimal swap amounts for a target CL range.
+ * @dev Internals walk the bundle across initialized ticks when needed and then
+ *      solve inside the active segment using exact swap math.
  */
 contract RebalancePlanner is Ownable {
-    using FullMath for uint256;
+    /*//////////////////////////////////////////////////////////////
+                               CONSTANTS
+    //////////////////////////////////////////////////////////////*/
 
-    error UsdcDecimalsTooLow();
+    address public immutable USDC;
+    ICLCore public immutable CORE;
+    uint256 public MAX_WALK_TICKS = 256;
+    uint256 internal constant FEE_SCALE = 1e6;
+    uint256 internal constant CLOSED_FORM_MAX_CORRECTION_STEPS = 2;
 
-    constructor(address usdc_, address owner_) Ownable(owner_) { 
-        if (usdc_ == address(0)) revert ZeroAddress();
-        USDC = usdc_; 
-        usdcDecimals = IERC20Metadata(address(USDC)).decimals();
-        if (usdcDecimals < 3) revert UsdcDecimalsTooLow();
-        // MIN_DELTA_USDC = $0.001 in token units.
-        MIN_DELTA_USDC = 10 ** uint256(usdcDecimals - 3);
-    }
-
-    /*────────────────────────────── Types ───────────────────────────────────*/
-
+    /*//////////////////////////////////////////////////////////////
+                                 TYPES
+    //////////////////////////////////////////////////////////////*/
 
     struct PoolContext {
-        address token0; address token1;
-        uint24 feePips;       // The actual fee used for math
+        address token0;
+        address token1;
+        uint24 feePips; // The actual fee used for math
         int24 tickSpacing;
-        int24 tickLower; int24 tickUpper;
-        uint160 sqrtPriceX96; uint160 sqrtLowerX96; uint160 sqrtUpperX96;
+        int24 tickLower;
+        int24 tickUpper;
+        int24 currentTick;
+        uint160 sqrtPriceX96;
+        uint160 sqrtLowerX96;
+        uint160 sqrtUpperX96;
         uint128 poolLiquidity;
         address poolAddress;
-        address dex;
-        address factory;
         bool isSlip;
     }
 
-    // Temp variable grouping to avoid "stack too deep" in _solveIterative
-    struct Vars {
-        uint256 C0;
-        uint256 C1;
-        uint256 priceX96;
-        uint256 val0in1;
-        uint256 valueUser;
-        uint256 valC0in1;
-        uint256 valuePerLiq;
-        uint256 L_ideal;
-        uint256 target0;
-        uint256 delta;
-        uint256 deltaValueIn1;
-        uint256 amountInLessFee;
-        uint256 amountOut;
-        uint256 amtToBoundary;
-        uint256 grossDelta;
-        uint256 num;
-        uint256 den;
-        uint256 reduce;
-        bool iterZeroForOne;
-        bool hitBoundary;
-        uint160 nextSqrtP;
+    struct ExactEval {
+        uint160 sqrtPriceX96;
+        uint256 amount0;
+        uint256 amount1;
+        uint256 grossAmountIn;
+        uint128 liquidity;
+        uint256 dustValueIn1;
+        int256 signedDustImbalanceIn1;
     }
 
-    /*────────────────────────────── Storage ──────────────────────────────────*/
+    struct PlanningState {
+        uint160 sqrtPriceX96;
+        int24 searchTick;
+        uint128 liquidity;
+        uint256 amount0;
+        uint256 amount1;
+        uint256 totalSwapAmount;
+    }
 
-    address public USDC;
-    uint8 public usdcDecimals;
+    struct SegmentBoundary {
+        uint160 sqrtTargetX96;
+        int24 nextTick;
+        bool initialized;
+    }
 
-    // Used for pool allowlists
-    address public CORE;
+    struct BitmapCursor {
+        int16 wordPos;
+        uint256 word;
+        bool loaded;
+    }
 
-    // On-chain valuation contract used to normalize a small absolute floor (USDC-denominated).
-    address public VALUATION;
+    struct SegmentStep {
+        PlanningState state;
+        SegmentBoundary boundary;
+        ExactEval eval_;
+        uint256 grossToBoundary;
+        uint256 available;
+    }
 
-    // Marks whether CORE has been set via the one-time setter
-    bool public coreSet;
-    
-    // Allow up to SOLVER_ITERATIONS damped Newton iterations to survive multi-tick whale trades.
-    uint256 public SOLVER_ITERATIONS = 16; // default value
+    struct EntryTransition {
+        PlanningState state;
+        uint256 walkBudgetRemaining;
+        bool earlyReturn;
+        bool hasEntryDirection;
+        bool entryZeroForOne;
+    }
 
-    // Minimum delta in USDC token units to consider meaningful. Default = $0.001
-    uint256 public MIN_DELTA_USDC;
-    // Minimum relative delta (parts per 100_000) to consider meaningful (0.001% default = 1)
-    uint256 public MIN_DELTA_BPS = 1;
-    
-    /*────────────────────────────── Errors ───────────────────────────────────*/
+    struct WalkResult {
+        PlanningState state;
+        PlanningState bracketState;
+        ExactEval lastEval;
+        ExactEval bracketLowEval;
+        ExactEval bracketHighEval;
+        uint160 bracketSqrtTargetX96;
+        uint256 bracketHighGross;
+        uint256 walkBudgetRemaining;
+        bool bracketed;
+        bool terminalReached;
+    }
 
-    error UnsupportedPool(); 
+    enum WalkMode {
+        BracketSearch,
+        Entry
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(address => bool) internal isBridgeTokenCached;
+
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    error UsdcDecimalsTooLow();
+    error UnsupportedPool();
     error PoolNotFound();
-    error InvalidTicks(); 
+    error InvalidTicks();
     error InvalidInput();
-    error MissingDexAdapter(); 
-    error ZeroAddress(); 
+    error MissingDexAdapter();
+    error ZeroAddress();
     error FeeFetchFailed();
     error Slot0Failed();
-    error AlreadySet();
+    error UnsupportedBitmap();
+    error InvalidPoolLiquidityState();
 
-    /*────────────────────────────── Init/Admin ─────────────────────────────────────*/
+    /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
 
-    function setCore(address core) external onlyOwner {
-        if (coreSet) revert AlreadySet();
-        if (core == address(0)) revert ZeroAddress();
-        CORE = core;
-        coreSet = true;
-    }
-    
-    function setValuation(address valuation) external onlyOwner {
-        VALUATION = valuation;
-    }
+    constructor(address usdc_, address core_, address owner_) Ownable(owner_) {
+        if (usdc_ == address(0) || core_ == address(0)) revert ZeroAddress();
+        USDC = usdc_;
+        CORE = ICLCore(core_);
+        uint8 usdcDecimals = IERC20Metadata(address(USDC)).decimals();
+        if (usdcDecimals < 3) revert UsdcDecimalsTooLow();
 
-    /// @notice Set maximum solver iterations used in the damped Newton solver
-    function setSolverIterations(uint256 iters) external onlyOwner {
-        if (iters == 0 || iters > 36) revert InvalidInput();
-        SOLVER_ITERATIONS = iters;
-    }
-
-    /// @notice Configure early-stop thresholds: absolute USDC floor and relative BPS threshold (parts per 100_000)
-    function setEarlyStop(uint256 minDeltaUsdc_, uint256 minDeltaBps_) external onlyOwner {
-        MIN_DELTA_USDC = minDeltaUsdc_;
-        MIN_DELTA_BPS = minDeltaBps_;
+        address[] memory bridges = CORE.bridgeTokens();
+        uint256 bridgesLen = bridges.length;
+        for (uint256 i = 0; i < bridgesLen; ++i) {
+            address bridge = bridges[i];
+            if (bridge == address(0) || bridge == USDC || isBridgeTokenCached[bridge]) continue;
+            isBridgeTokenCached[bridge] = true;
+        }
     }
 
-    /*────────────────────────────── Entrypoints ──────────────────────────────*/
+    /*//////////////////////////////////////////////////////////////
+                           ADMIN CONFIGURATION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Sets the maximum number of exact boundary-walk steps before approximation.
+    function setMaxWalkTicks(uint256 maxWalkTicks) external onlyOwner {
+        if (maxWalkTicks == 0 || maxWalkTicks > 96) revert InvalidInput();
+        MAX_WALK_TICKS = maxWalkTicks;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               USER FLOWS
+    //////////////////////////////////////////////////////////////*/
 
     function planFromTokenBundle(
         address dex,
@@ -152,20 +195,6 @@ contract RebalancePlanner is Ownable {
         address factory = ICLDexAdapter(dex).getFactory();
         PoolContext memory pc = _loadPoolContext(dex, pool, factory, token0, token1, tickLower, tickUpper);
 
-        // Determine a small absolute floor converted into token1 units using the valuation contract.
-        uint256 minDeltaToken1 = 0;
-        if (VALUATION != address(0)) {
-            // Use the token's decimals to request the valuation of "1 token" (i.e. 10**decimals)
-            uint8 token1Decimals = IERC20Metadata(pc.token1).decimals();
-
-            uint256 oneTokenUnit = 10 ** uint256(token1Decimals);
-            uint256 oneToken1InUSDC = IValuation(VALUATION).usdcValue(dex, pc.token1, oneTokenUnit);
-            if (oneToken1InUSDC > 0) {
-                minDeltaToken1 = FullMath.mulDiv(MIN_DELTA_USDC, 1, oneToken1InUSDC);
-                if (minDeltaToken1 == 0) minDeltaToken1 = 1; // ensure non-zero floor
-            }
-        }
-
         // Defensive handling: ensure input amounts align with the pool's token ordering.
         // _loadPoolContext guarantees the pool exists and exposes its token0/token1 via pc.token0/pc.token1.
         // If the caller provided token0/token1 in the opposite order, swap the amounts so that
@@ -176,182 +205,731 @@ contract RebalancePlanner is Ownable {
             amount1 = tmp;
         }
 
-        params = _solveIterative(pc, amount0, amount1, minDeltaToken1);
+        params = _solveIterative(pc, amount0, amount1);
     }
 
-    /*──────────────── Optimization Algorithm (Newton-Raphson) ────────────────*/
-    function _solveIterative(
+    /*//////////////////////////////////////////////////////////////
+                            INTERNAL HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Planner flow:
+     * 1. If price starts outside the requested range, spend into the range first.
+     * 2. Walk initialized segments until the solution is bracketed in the active segment.
+     * 3. Solve the in-segment target with the closed form and polish with exact swap evals.
+     */
+    function _solveIterative(PoolContext memory pc, uint256 amount0, uint256 amount1)
+        internal
+        view
+        returns (RebalanceParams memory params)
+    {
+        if (pc.poolLiquidity == 0) return params;
+        BitmapCursor memory cursor;
+        PlanningState memory state = _initialPlanningState(pc, amount0, amount1);
+        EntryTransition memory entry = _enterRangeIfNeeded(pc, state, cursor);
+        if (entry.earlyReturn) {
+            return _finalizeParams(params, entry.entryZeroForOne, entry.state.totalSwapAmount, amount0, amount1);
+        }
+
+        ExactEval memory currentEval =
+            _scoreState(pc, entry.state.sqrtPriceX96, entry.state.amount0, entry.state.amount1, 0);
+        if (currentEval.signedDustImbalanceIn1 == 0) {
+            bool finalizeZeroForOne = entry.hasEntryDirection ? entry.entryZeroForOne : false;
+            return _finalizeParams(params, finalizeZeroForOne, entry.state.totalSwapAmount, amount0, amount1);
+        }
+
+        bool zeroForOne = currentEval.signedDustImbalanceIn1 > 0;
+        int24 terminalTick = zeroForOne ? pc.tickLower : pc.tickUpper;
+        uint160 terminalSqrtX96 = zeroForOne ? pc.sqrtLowerX96 : pc.sqrtUpperX96;
+
+        WalkResult memory walk = _walkSegments(
+            pc,
+            entry.state,
+            currentEval,
+            zeroForOne,
+            terminalTick,
+            terminalSqrtX96,
+            entry.walkBudgetRemaining,
+            cursor,
+            WalkMode.BracketSearch
+        );
+
+        if (walk.bracketed) {
+            ExactEval memory best = _solveInsideSegment(
+                pc,
+                walk.bracketState,
+                zeroForOne,
+                walk.bracketSqrtTargetX96,
+                walk.bracketHighGross,
+                walk.bracketLowEval,
+                walk.bracketHighEval
+            );
+            walk.state = walk.bracketState;
+            walk.state.totalSwapAmount += best.grossAmountIn;
+        }
+
+        return _finalizeParams(params, zeroForOne, walk.state.totalSwapAmount, amount0, amount1);
+    }
+
+    function _initialPlanningState(PoolContext memory pc, uint256 amount0, uint256 amount1)
+        internal
+        pure
+        returns (PlanningState memory state)
+    {
+        state.sqrtPriceX96 = pc.sqrtPriceX96;
+        state.searchTick = pc.currentTick;
+        state.liquidity = pc.poolLiquidity;
+        state.amount0 = amount0;
+        state.amount1 = amount1;
+    }
+
+    function _enterRangeIfNeeded(PoolContext memory pc, PlanningState memory state, BitmapCursor memory cursor)
+        internal
+        view
+        returns (EntryTransition memory transition)
+    {
+        transition.state = state;
+        transition.walkBudgetRemaining = MAX_WALK_TICKS;
+
+        if (state.sqrtPriceX96 < pc.sqrtLowerX96) {
+            transition.hasEntryDirection = true;
+            transition.entryZeroForOne = false;
+
+            WalkResult memory walk = _walkSegments(
+                pc,
+                state,
+                _zeroEval(),
+                false,
+                pc.tickLower,
+                pc.sqrtLowerX96,
+                transition.walkBudgetRemaining,
+                cursor,
+                WalkMode.Entry
+            );
+            transition.state = walk.state;
+            transition.walkBudgetRemaining = walk.walkBudgetRemaining;
+            transition.earlyReturn = !walk.terminalReached || transition.state.amount1 == 0;
+            return transition;
+        }
+
+        if (state.sqrtPriceX96 > pc.sqrtUpperX96) {
+            transition.hasEntryDirection = true;
+            transition.entryZeroForOne = true;
+
+            WalkResult memory walk = _walkSegments(
+                pc,
+                state,
+                _zeroEval(),
+                true,
+                pc.tickUpper,
+                pc.sqrtUpperX96,
+                transition.walkBudgetRemaining,
+                cursor,
+                WalkMode.Entry
+            );
+            transition.state = walk.state;
+            transition.walkBudgetRemaining = walk.walkBudgetRemaining;
+            transition.earlyReturn = !walk.terminalReached || transition.state.amount0 == 0;
+        }
+    }
+
+    function _segmentIsBracketed(ExactEval memory lowEval, ExactEval memory highEval) internal pure returns (bool) {
+        return !_sameSign(lowEval.signedDustImbalanceIn1, highEval.signedDustImbalanceIn1)
+            || highEval.signedDustImbalanceIn1 == 0;
+    }
+
+    function _walkSegments(
         PoolContext memory pc,
+        PlanningState memory state,
+        ExactEval memory currentEval,
+        bool zeroForOne,
+        int24 terminalTick,
+        uint160 terminalSqrtX96,
+        uint256 walkBudgetRemaining,
+        BitmapCursor memory cursor,
+        WalkMode mode
+    ) internal view returns (WalkResult memory result) {
+        result.state = state;
+        result.lastEval = currentEval;
+        result.walkBudgetRemaining = walkBudgetRemaining;
+
+        while (result.walkBudgetRemaining > 0) {
+            if (result.state.sqrtPriceX96 == terminalSqrtX96) {
+                result.terminalReached = true;
+                return result;
+            }
+
+            SegmentStep memory step =
+                _stepTowardBoundary(pc, result.state, zeroForOne, terminalTick, terminalSqrtX96, cursor);
+            if (step.eval_.grossAmountIn == 0) {
+                return result;
+            }
+
+            if (mode == WalkMode.BracketSearch && _segmentIsBracketed(result.lastEval, step.eval_)) {
+                result.bracketed = true;
+                result.bracketState = result.state;
+                result.bracketLowEval = result.lastEval;
+                result.bracketHighEval = step.eval_;
+                result.bracketSqrtTargetX96 = step.boundary.sqrtTargetX96;
+                result.bracketHighGross = step.eval_.grossAmountIn;
+                return result;
+            }
+
+            result.state = step.state;
+            result.lastEval = step.eval_;
+
+            bool crossedTerminal = step.boundary.initialized && step.boundary.nextTick == terminalTick
+                && result.state.sqrtPriceX96 == terminalSqrtX96;
+            if (crossedTerminal && mode == WalkMode.Entry) {
+                result.state.liquidity =
+                    _crossInitializedTick(pc.poolAddress, result.state.liquidity, terminalTick, zeroForOne, pc.isSlip);
+            }
+
+            if (_shouldStopAfterStep(step.eval_, step.grossToBoundary, step.available)) {
+                result.terminalReached = result.state.sqrtPriceX96 == terminalSqrtX96;
+                return result;
+            }
+
+            if (
+                step.boundary.initialized && step.boundary.nextTick != terminalTick
+                    && (
+                        mode == WalkMode.Entry
+                            || (step.boundary.nextTick > pc.tickLower && step.boundary.nextTick < pc.tickUpper)
+                    )
+            ) {
+                result.state.liquidity = _crossInitializedTick(
+                    pc.poolAddress, result.state.liquidity, step.boundary.nextTick, zeroForOne, pc.isSlip
+                );
+            }
+
+            if (result.state.sqrtPriceX96 == terminalSqrtX96) {
+                result.terminalReached = true;
+                return result;
+            }
+
+            unchecked {
+                --result.walkBudgetRemaining;
+            }
+        }
+
+        SegmentStep memory finalStep =
+            _constantLiquidityStep(pc, result.state, zeroForOne, terminalTick, terminalSqrtX96, mode == WalkMode.Entry);
+        if (finalStep.eval_.grossAmountIn == 0) return result;
+
+        if (mode == WalkMode.BracketSearch && _segmentIsBracketed(result.lastEval, finalStep.eval_)) {
+            result.bracketed = true;
+            result.bracketState = result.state;
+            result.bracketLowEval = result.lastEval;
+            result.bracketHighEval = finalStep.eval_;
+            result.bracketSqrtTargetX96 = terminalSqrtX96;
+            result.bracketHighGross = finalStep.eval_.grossAmountIn;
+            return result;
+        }
+
+        result.state = finalStep.state;
+        result.terminalReached = result.state.sqrtPriceX96 == terminalSqrtX96;
+        result.lastEval = finalStep.eval_;
+    }
+
+    function _segmentBoundary(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        int24 terminalTick,
+        uint160 terminalSqrtX96,
+        BitmapCursor memory cursor
+    ) internal view returns (SegmentBoundary memory boundary) {
+        boundary.sqrtTargetX96 = terminalSqrtX96;
+        boundary.nextTick = terminalTick;
+
+        (int24 nextTick, bool initialized, bool supported) =
+            _nextInitializedTickWithinOneWord(pc.poolAddress, state.searchTick, pc.tickSpacing, zeroForOne, cursor);
+        if (!supported) revert UnsupportedBitmap();
+
+        if (zeroForOne) {
+            if (nextTick < terminalTick) nextTick = terminalTick;
+        } else {
+            if (nextTick > terminalTick) nextTick = terminalTick;
+        }
+
+        uint160 nextSqrt = TickMath.getSqrtRatioAtTick(nextTick);
+        if ((zeroForOne && nextSqrt < state.sqrtPriceX96) || (!zeroForOne && nextSqrt > state.sqrtPriceX96)) {
+            boundary.sqrtTargetX96 = nextSqrt;
+            boundary.nextTick = nextTick;
+            boundary.initialized = initialized;
+        }
+    }
+
+    function _stepTowardBoundary(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        int24 terminalTick,
+        uint160 terminalSqrtX96,
+        BitmapCursor memory cursor
+    ) internal view returns (SegmentStep memory step) {
+        step.boundary = _segmentBoundary(pc, state, zeroForOne, terminalTick, terminalSqrtX96, cursor);
+        step.grossToBoundary = _grossToReachTarget(
+            state.sqrtPriceX96, step.boundary.sqrtTargetX96, state.liquidity, zeroForOne, pc.feePips
+        );
+        step.available = zeroForOne ? state.amount0 : state.amount1;
+        step.eval_ = _moveTowardBoundary(pc, state, zeroForOne, step.boundary.sqrtTargetX96, step.grossToBoundary);
+        if (step.eval_.grossAmountIn == 0) return step;
+        step.state = _applyEval(state, step.eval_, zeroForOne, step.boundary, step.grossToBoundary);
+    }
+
+    function _constantLiquidityStep(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        int24 terminalTick,
+        uint160 terminalSqrtX96,
+        bool crossTerminal
+    ) internal view returns (SegmentStep memory step) {
+        step.boundary = SegmentBoundary({
+            sqrtTargetX96: terminalSqrtX96,
+            nextTick: terminalTick,
+            initialized: crossTerminal && _tickInitialized(pc.poolAddress, terminalTick, pc.isSlip)
+        });
+        step.grossToBoundary =
+            _grossToReachTarget(state.sqrtPriceX96, terminalSqrtX96, state.liquidity, zeroForOne, pc.feePips);
+        step.available = zeroForOne ? state.amount0 : state.amount1;
+        step.eval_ = _moveTowardBoundary(pc, state, zeroForOne, terminalSqrtX96, step.grossToBoundary);
+        if (step.eval_.grossAmountIn == 0) return step;
+
+        step.state = _applyEval(state, step.eval_, zeroForOne, step.boundary, step.grossToBoundary);
+        if (step.boundary.initialized && step.state.sqrtPriceX96 == terminalSqrtX96) {
+            step.state.liquidity =
+                _crossInitializedTick(pc.poolAddress, step.state.liquidity, terminalTick, zeroForOne, pc.isSlip);
+        }
+    }
+
+    function _moveTowardBoundary(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96,
+        uint256 grossToBoundary
+    ) internal pure returns (ExactEval memory eval_) {
+        uint256 availableIn = zeroForOne ? state.amount0 : state.amount1;
+        if (availableIn == 0 || sqrtTargetX96 == state.sqrtPriceX96) {
+            return _scoreState(pc, state.sqrtPriceX96, state.amount0, state.amount1, 0);
+        }
+
+        uint256 grossAmountIn = grossToBoundary > availableIn ? availableIn : grossToBoundary;
+        return _simulateSegmentExactIn(pc, state, zeroForOne, sqrtTargetX96, grossAmountIn);
+    }
+
+    function _simulateSegmentExactIn(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96,
+        uint256 grossAmountIn
+    ) internal pure returns (ExactEval memory eval_) {
+        uint256 availableIn = zeroForOne ? state.amount0 : state.amount1;
+        if (grossAmountIn > availableIn) grossAmountIn = availableIn;
+        if (grossAmountIn == 0) return _scoreState(pc, state.sqrtPriceX96, state.amount0, state.amount1, 0);
+
+        uint256 amountInLessFee;
+        uint256 amountOut;
+        uint256 feeAmount;
+        uint160 sqrtPriceX96;
+        (sqrtPriceX96, amountInLessFee, amountOut, feeAmount) = SwapMath.computeSwapStep(
+            state.sqrtPriceX96, sqrtTargetX96, state.liquidity, int256(grossAmountIn), pc.feePips
+        );
+
+        grossAmountIn = amountInLessFee + feeAmount;
+        uint256 amount0 = state.amount0;
+        uint256 amount1 = state.amount1;
+        if (zeroForOne) {
+            amount0 = grossAmountIn >= state.amount0 ? 0 : state.amount0 - grossAmountIn;
+            amount1 = state.amount1 + amountOut;
+        } else {
+            amount1 = grossAmountIn >= state.amount1 ? 0 : state.amount1 - grossAmountIn;
+            amount0 = state.amount0 + amountOut;
+        }
+
+        eval_ = _scoreState(pc, sqrtPriceX96, amount0, amount1, grossAmountIn);
+    }
+
+    function _solveInsideSegment(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96,
+        uint256 highGross,
+        ExactEval memory lowEval,
+        ExactEval memory highEval
+    ) internal pure returns (ExactEval memory bestEval) {
+        bestEval = _isBetterEval(highEval, lowEval) ? highEval : lowEval;
+        (uint160 root0X96, uint160 root1X96) = _solveClosedFormRootCandidates(pc, state, zeroForOne, sqrtTargetX96);
+
+        ExactEval memory correctionSeed;
+        bool hasCorrectionSeed;
+
+        if (root0X96 != 0) {
+            (bestEval, correctionSeed, hasCorrectionSeed) = _evaluateClosedFormCandidate(
+                pc, state, zeroForOne, sqrtTargetX96, highGross, lowEval, highEval, bestEval, root0X96
+            );
+            if (correctionSeed.signedDustImbalanceIn1 == 0) return correctionSeed;
+        }
+
+        if (root1X96 != 0 && root1X96 != root0X96) {
+            ExactEval memory candidateEval;
+            bool candidateSeed;
+            (bestEval, candidateEval, candidateSeed) = _evaluateClosedFormCandidate(
+                pc, state, zeroForOne, sqrtTargetX96, highGross, lowEval, highEval, bestEval, root1X96
+            );
+            if (candidateEval.signedDustImbalanceIn1 == 0) return candidateEval;
+            if (!hasCorrectionSeed || _isBetterEval(candidateEval, correctionSeed)) {
+                correctionSeed = candidateEval;
+                hasCorrectionSeed = candidateSeed;
+            }
+        }
+
+        if (!hasCorrectionSeed) return bestEval;
+
+        return _correctDiscreteClosedForm(
+            pc,
+            state,
+            zeroForOne,
+            sqrtTargetX96,
+            correctionSeed.grossAmountIn,
+            correctionSeed,
+            lowEval,
+            highEval,
+            bestEval,
+            highGross
+        );
+    }
+
+    function _evaluateClosedFormCandidate(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96,
+        uint256 highGross,
+        ExactEval memory lowEval,
+        ExactEval memory highEval,
+        ExactEval memory bestEval,
+        uint160 solvedSqrtX96
+    ) internal pure returns (ExactEval memory nextBestEval, ExactEval memory candidateEval, bool hasCandidate) {
+        uint256 predictedGross =
+            _grossToReachTarget(state.sqrtPriceX96, solvedSqrtX96, state.liquidity, zeroForOne, pc.feePips);
+        if (predictedGross > highGross) predictedGross = highGross;
+
+        candidateEval = _simulateSegmentExactIn(pc, state, zeroForOne, sqrtTargetX96, predictedGross);
+        nextBestEval = _isBetterEval(candidateEval, bestEval) ? candidateEval : bestEval;
+        hasCandidate = _closedFormCorrectionDirection(candidateEval, lowEval, highEval) != 0;
+    }
+
+    function _correctDiscreteClosedForm(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96,
+        uint256 predictedGross,
+        ExactEval memory predictedEval,
+        ExactEval memory lowEval,
+        ExactEval memory highEval,
+        ExactEval memory bestEval,
+        uint256 highGross
+    ) internal pure returns (ExactEval memory) {
+        int256 direction = _closedFormCorrectionDirection(predictedEval, lowEval, highEval);
+        if (direction == 0) return bestEval;
+
+        uint256 gross = predictedGross;
+        ExactEval memory currentEval = predictedEval;
+
+        for (uint256 i = 0; i < CLOSED_FORM_MAX_CORRECTION_STEPS; ++i) {
+            if (direction > 0) {
+                if (gross == highGross) break;
+                unchecked {
+                    ++gross;
+                }
+            } else {
+                if (gross == 0) break;
+                unchecked {
+                    --gross;
+                }
+            }
+
+            ExactEval memory nextEval = _simulateSegmentExactIn(pc, state, zeroForOne, sqrtTargetX96, gross);
+            if (_isBetterEval(nextEval, bestEval)) bestEval = nextEval;
+            if (nextEval.signedDustImbalanceIn1 == 0) return nextEval;
+            if (!_sameSign(currentEval.signedDustImbalanceIn1, nextEval.signedDustImbalanceIn1)) break;
+            if (!_isBetterEval(nextEval, currentEval)) break;
+
+            currentEval = nextEval;
+        }
+
+        return bestEval;
+    }
+
+    function _solveClosedFormRootCandidates(
+        PoolContext memory pc,
+        PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96
+    ) internal pure returns (uint160 root0X96, uint160 root1X96) {
+        return RebalancePlannerUtils.solveClosedFormRootCandidates(pc, state, zeroForOne, sqrtTargetX96);
+    }
+
+    function _applyEval(
+        PlanningState memory state,
+        ExactEval memory eval_,
+        bool zeroForOne,
+        SegmentBoundary memory boundary,
+        uint256 grossToBoundary
+    ) internal pure returns (PlanningState memory) {
+        PlanningState memory nextState;
+        nextState.sqrtPriceX96 = state.sqrtPriceX96;
+        nextState.searchTick = state.searchTick;
+        nextState.liquidity = state.liquidity;
+        nextState.amount0 = state.amount0;
+        nextState.amount1 = state.amount1;
+        nextState.totalSwapAmount = state.totalSwapAmount;
+        nextState.sqrtPriceX96 = eval_.sqrtPriceX96;
+        nextState.amount0 = eval_.amount0;
+        nextState.amount1 = eval_.amount1;
+        nextState.totalSwapAmount += eval_.grossAmountIn;
+        if (eval_.grossAmountIn >= grossToBoundary && eval_.sqrtPriceX96 == boundary.sqrtTargetX96) {
+            if (zeroForOne) {
+                nextState.searchTick =
+                    boundary.nextTick == TickMath.MIN_TICK ? TickMath.MIN_TICK : boundary.nextTick - 1;
+            } else {
+                nextState.searchTick = boundary.nextTick;
+            }
+        } else {
+            nextState.searchTick = TickMath.getTickAtSqrtRatio(eval_.sqrtPriceX96);
+        }
+        return nextState;
+    }
+
+    function _finalizeParams(
+        RebalanceParams memory params,
+        bool zeroForOne,
+        uint256 totalSwapAmount,
+        uint256 amount0,
+        uint256 amount1
+    ) internal pure returns (RebalanceParams memory) {
+        if (zeroForOne) {
+            params.token0ToToken1 = totalSwapAmount > amount0 ? amount0 : totalSwapAmount;
+        } else {
+            params.token1ToToken0 = totalSwapAmount > amount1 ? amount1 : totalSwapAmount;
+        }
+        return params;
+    }
+
+    function _grossToReachTarget(
+        uint160 sqrtStartX96,
+        uint160 sqrtTargetX96,
+        uint128 liquidity,
+        bool zeroForOne,
+        uint24 feePips
+    ) internal pure returns (uint256) {
+        if (sqrtStartX96 == sqrtTargetX96) return 0;
+        uint256 netAmountIn = zeroForOne
+            ? SqrtPriceMath.getAmount0Delta(sqrtTargetX96, sqrtStartX96, liquidity, true)
+            : SqrtPriceMath.getAmount1Delta(sqrtStartX96, sqrtTargetX96, liquidity, true);
+        return FullMath.mulDivRoundingUp(netAmountIn, 1e6, 1e6 - feePips);
+    }
+
+    function _crossInitializedTick(address pool, uint128 liquidity, int24 nextTick, bool zeroForOne, bool isSlip)
+        internal
+        view
+        returns (uint128 nextLiquidity)
+    {
+        nextLiquidity = liquidity;
+        int128 liquidityNet = _tickLiquidityNet(pool, nextTick, isSlip);
+        if (zeroForOne && liquidityNet == type(int128).min) revert InvalidPoolLiquidityState();
+        if (zeroForOne) liquidityNet = -liquidityNet;
+
+        if (liquidityNet < 0) {
+            uint128 liquidityDelta = uint128(-liquidityNet);
+            if (liquidityDelta > nextLiquidity) revert InvalidPoolLiquidityState();
+            nextLiquidity -= liquidityDelta;
+        } else {
+            uint128 liquidityDelta = uint128(liquidityNet);
+            if (type(uint128).max - nextLiquidity < liquidityDelta) revert InvalidPoolLiquidityState();
+            nextLiquidity += liquidityDelta;
+        }
+    }
+
+    function _tickLiquidityNet(address pool, int24 tick, bool isSlip) internal view returns (int128 liquidityNet) {
+        if (isSlip) {
+            // Slipstream tracks staked liquidity as a subset of the same active liquidity.
+            // Tick crossing for swap math should use the pool's total liquidity net, not add
+            // the staked subset delta a second time.
+            (, liquidityNet,,,,,,,,) = ISlipstreamPoolState(pool).ticks(tick);
+        } else {
+            (, liquidityNet,,,,,,) = IUniswapV3Pool(pool).ticks(tick);
+        }
+    }
+
+    function _tickInitialized(address pool, int24 tick, bool isSlip) internal view returns (bool initialized) {
+        if (isSlip) {
+            (,,,,,,,,, initialized) = ISlipstreamPoolState(pool).ticks(tick);
+        } else {
+            (,,,,,,, initialized) = IUniswapV3Pool(pool).ticks(tick);
+        }
+    }
+
+    function _nextInitializedTickWithinOneWord(
+        address pool,
+        int24 tick,
+        int24 tickSpacing,
+        bool lte,
+        BitmapCursor memory cursor
+    ) internal view returns (int24 next, bool initialized, bool supported) {
+        int24 compressed = tick / tickSpacing;
+        if (tick < 0 && tick % tickSpacing != 0) compressed--;
+
+        if (lte) {
+            (int16 wordPos, uint8 bitPos) = _bitmapPosition(compressed);
+            (uint256 word, bool ok) = _tickBitmapWord(pool, wordPos, cursor);
+            if (!ok) return (0, false, false);
+
+            uint256 mask = (uint256(1) << bitPos) - 1 + (uint256(1) << bitPos);
+            uint256 masked = word & mask;
+            initialized = masked != 0;
+            next = initialized
+                ? (compressed - int24(uint24(bitPos - BitMath.mostSignificantBit(masked)))) * tickSpacing
+                : (compressed - int24(uint24(bitPos))) * tickSpacing;
+        } else {
+            (int16 wordPos, uint8 bitPos) = _bitmapPosition(compressed + 1);
+            (uint256 word, bool ok) = _tickBitmapWord(pool, wordPos, cursor);
+            if (!ok) return (0, false, false);
+
+            uint256 mask = ~((uint256(1) << bitPos) - 1);
+            uint256 masked = word & mask;
+            initialized = masked != 0;
+            next = initialized
+                ? (compressed + 1 + int24(uint24(BitMath.leastSignificantBit(masked) - bitPos))) * tickSpacing
+                : (compressed + 1 + int24(uint24(type(uint8).max - bitPos))) * tickSpacing;
+        }
+
+        supported = true;
+    }
+
+    function _bitmapPosition(int24 tick) internal pure returns (int16 wordPos, uint8 bitPos) {
+        wordPos = int16(tick >> 8);
+        bitPos = uint8(int8(tick % 256));
+    }
+
+    function _tickBitmapWord(address pool, int16 wordPos, BitmapCursor memory cursor)
+        internal
+        view
+        returns (uint256 word, bool ok)
+    {
+        if (cursor.loaded && cursor.wordPos == wordPos) return (cursor.word, true);
+
+        bytes memory data;
+        (ok, data) = pool.staticcall(abi.encodeWithSelector(IUniswapV3Pool.tickBitmap.selector, wordPos));
+        if (!ok || data.length < 32) return (0, false);
+        word = abi.decode(data, (uint256));
+        cursor.wordPos = wordPos;
+        cursor.word = word;
+        cursor.loaded = true;
+    }
+
+    function _scoreState(
+        PoolContext memory pc,
+        uint160 sqrtPriceX96,
         uint256 amount0,
         uint256 amount1,
-        uint256 minDeltaToken1
-    ) internal view returns (RebalanceParams memory params) {
-        // 1. Boundary Checks
-        if (pc.sqrtPriceX96 <= pc.sqrtLowerX96) {
-            if (amount1 > 0) params.token1ToToken0 = amount1;
-            return params;
-        }
-        if (pc.sqrtPriceX96 >= pc.sqrtUpperX96) {
-            if (amount0 > 0) params.token0ToToken1 = amount0;
-            return params;
-        }
+        uint256 grossAmountIn
+    ) internal pure returns (ExactEval memory eval_) {
+        eval_.sqrtPriceX96 = sqrtPriceX96;
+        eval_.amount0 = amount0;
+        eval_.amount1 = amount1;
+        eval_.grossAmountIn = grossAmountIn;
 
-        uint256 currentAmt0 = amount0;
-        uint256 currentAmt1 = amount1;
-        uint160 currentSqrtP = pc.sqrtPriceX96;
+        uint128 liquidity0;
+        uint128 liquidity1;
+        uint256 used0;
+        uint256 used1;
+        uint256 dust0;
+        uint256 dust1;
+        uint256 dust0ValueIn1;
 
-        bool globalZeroForOne;
-        uint256 totalSwapAmount = 0;
-        bool isDirectionSet = false;
-        uint256 feeComp = 1e6 - pc.feePips;
-
-        Vars memory v;
-
-        for (uint256 i = 0; i < SOLVER_ITERATIONS; ) {
-            // A. Calculate Capacities (Tokens per unit of L at current price)
-            v.C0 = FullMath.mulDiv(
-                uint256(pc.sqrtUpperX96 - currentSqrtP),
-                FixedPoint96.Q96,
-                FullMath.mulDiv(currentSqrtP, pc.sqrtUpperX96, FixedPoint96.Q96)
-            );
-
-            v.C1 = uint256(currentSqrtP - pc.sqrtLowerX96);
-
-            // B. Calculate Portfolio Value in "Liquidity Units"
-            v.priceX96 = FullMath.mulDiv(currentSqrtP, currentSqrtP, FixedPoint96.Q96);
-
-            v.val0in1 = FullMath.mulDiv(currentAmt0, v.priceX96, FixedPoint96.Q96);
-            v.valueUser = currentAmt1 + v.val0in1;
-
-            v.valC0in1 = FullMath.mulDiv(v.C0, v.priceX96, FixedPoint96.Q96);
-            v.valuePerLiq = v.C1 + v.valC0in1;
-            
-            if (v.valuePerLiq == 0) break; 
-
-            // C. Calculate Ideal Liquidity & Target Token0
-            v.L_ideal = FullMath.mulDiv(v.valueUser, FixedPoint96.Q96, v.valuePerLiq);
-            v.target0 = FullMath.mulDiv(v.L_ideal, v.C0, FixedPoint96.Q96);
-
-            // D. Calculate Delta (Swap needed)
-            v.delta = 0;
-            if (currentAmt0 > v.target0) {
-                v.iterZeroForOne = true;
-                v.delta = currentAmt0 - v.target0;
-            } else {
-                v.iterZeroForOne = false;
-                v.delta = v.target0 - currentAmt0;
-                v.delta = FullMath.mulDiv(v.delta, v.priceX96, FixedPoint96.Q96);
-            }
-
-            // Convergence check
-            v.deltaValueIn1 = v.iterZeroForOne
-                ? FullMath.mulDiv(v.delta, v.priceX96, FixedPoint96.Q96) // token0 → value in token1
-                : v.delta; // already token1
-
-            // Early stop when relative change is below MIN_DELTA_BPS (parts per 100_000)
-            if (MIN_DELTA_BPS > 0) {
-                uint256 relThreshold = v.valueUser / (100_000 / MIN_DELTA_BPS);
-                if (v.deltaValueIn1 <= relThreshold) break;
-            }
-            // Or when absolute USDC-based floor is reached
-            if (minDeltaToken1 > 0 && v.deltaValueIn1 <= minDeltaToken1) break;
-
-            // E. Apply Damping (Newton Derivative)
-            if (pc.poolLiquidity > 0) {
-                v.num = uint256(pc.poolLiquidity);
-                v.den = v.num + v.L_ideal;
-                // Use rounding-up to avoid truncation to zero for very small deltas.
-                v.delta = FullMath.mulDivRoundingUp(v.delta, v.num, v.den);
-            }
-
-            // F. Simulate Step (Exact V3 Math)
-            v.amountInLessFee = FullMath.mulDiv(v.delta, feeComp, 1e6);
-
-            // Detect if the simulated input would cross the tick boundary. If so,
-            // compute the exact amount required to move price to the boundary and
-            // cap the step to that amount. This prevents library reverts from
-            // attempting to move price past TickMath limits and avoids unsigned
-            // underflow when recomputing capacities.
-            v.hitBoundary = false;
-
-            if (v.iterZeroForOne) {
-                // Swapping token0 -> token1 moves price down towards sqrtLowerX96
-                v.amtToBoundary = SqrtPriceMath.getAmount0Delta(pc.sqrtLowerX96, currentSqrtP, pc.poolLiquidity, true);
-                if (v.amountInLessFee >= v.amtToBoundary) {
-                    // Need to convert amtToBoundary (post-fee) to gross delta (pre-fee)
-                    v.grossDelta = FullMath.mulDivRoundingUp(v.amtToBoundary, 1e6, feeComp);
-                    v.delta = v.grossDelta;
-                    v.amountInLessFee = v.amtToBoundary;
-                    v.nextSqrtP = pc.sqrtLowerX96;
-                    v.amountOut = SqrtPriceMath.getAmount1Delta(v.nextSqrtP, currentSqrtP, pc.poolLiquidity, false);
-                    v.hitBoundary = true;
-                }
-            } else {
-                // Swapping token1 -> token0 moves price up towards sqrtUpperX96
-                v.amtToBoundary = SqrtPriceMath.getAmount1Delta(currentSqrtP, pc.sqrtUpperX96, pc.poolLiquidity, true);
-                if (v.amountInLessFee >= v.amtToBoundary) {
-                    v.grossDelta = FullMath.mulDivRoundingUp(v.amtToBoundary, 1e6, feeComp);
-                    v.delta = v.grossDelta;
-                    v.amountInLessFee = v.amtToBoundary;
-                    v.nextSqrtP = pc.sqrtUpperX96;
-                    v.amountOut = SqrtPriceMath.getAmount0Delta(currentSqrtP, v.nextSqrtP, pc.poolLiquidity, false);
-                    v.hitBoundary = true;
-                }
-            }
-
-            if (!v.hitBoundary) {
-                v.nextSqrtP = SqrtPriceMath.getNextSqrtPriceFromInput(
-                    currentSqrtP,
-                    pc.poolLiquidity,
-                    v.amountInLessFee,
-                    v.iterZeroForOne
-                );
-
-                if (v.iterZeroForOne) {
-                    v.amountOut = SqrtPriceMath.getAmount1Delta(v.nextSqrtP, currentSqrtP, pc.poolLiquidity, false);
-                } else {
-                    v.amountOut = SqrtPriceMath.getAmount0Delta(currentSqrtP, v.nextSqrtP, pc.poolLiquidity, false);
-                }
-            }
-
-            // G. Update Globals & Handle Overshoot
-            if (!isDirectionSet) {
-                globalZeroForOne = v.iterZeroForOne;
-                isDirectionSet = true;
-                totalSwapAmount = v.delta;
-            } else {
-                if (globalZeroForOne == v.iterZeroForOne) {
-                    totalSwapAmount += v.delta;
-                } else {
-                    // Overshoot: Backtrack by half the delta
-                    v.reduce = v.delta < totalSwapAmount ? v.delta : totalSwapAmount / 2;
-                    totalSwapAmount -= v.reduce;
-                }
-            }
-
-            // H. Update Virtual Balances
-            currentSqrtP = uint160(v.nextSqrtP);
-            if (v.iterZeroForOne) {
-                currentAmt0 = (v.delta >= currentAmt0) ? 0 : currentAmt0 - v.delta;
-                currentAmt1 += v.amountOut;
-            } else {
-                currentAmt1 = (v.delta >= currentAmt1) ? 0 : currentAmt1 - v.delta;
-                currentAmt0 += v.amountOut;
-            }
-
-            unchecked { ++i; }
-        }
-        
-        // Final Safety Cap
-        if (globalZeroForOne) {
-            params.token0ToToken1 = (totalSwapAmount > amount0) ? amount0 : totalSwapAmount;
+        if (sqrtPriceX96 <= pc.sqrtLowerX96) {
+            liquidity0 = LiquidityAmounts.getLiquidityForAmount0(pc.sqrtLowerX96, pc.sqrtUpperX96, amount0);
+            eval_.liquidity = liquidity0;
+        } else if (sqrtPriceX96 >= pc.sqrtUpperX96) {
+            liquidity1 = LiquidityAmounts.getLiquidityForAmount1(pc.sqrtLowerX96, pc.sqrtUpperX96, amount1);
+            eval_.liquidity = liquidity1;
         } else {
-            params.token1ToToken0 = (totalSwapAmount > amount1) ? amount1 : totalSwapAmount;
+            liquidity0 = LiquidityAmounts.getLiquidityForAmount0(sqrtPriceX96, pc.sqrtUpperX96, amount0);
+            liquidity1 = LiquidityAmounts.getLiquidityForAmount1(pc.sqrtLowerX96, sqrtPriceX96, amount1);
+            eval_.liquidity = liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+        }
+
+        (used0, used1) =
+            LiquidityAmounts.getAmountsForLiquidity(sqrtPriceX96, pc.sqrtLowerX96, pc.sqrtUpperX96, eval_.liquidity);
+
+        dust0 = amount0 > used0 ? amount0 - used0 : 0;
+        dust1 = amount1 > used1 ? amount1 - used1 : 0;
+        dust0ValueIn1 =
+            FullMath.mulDiv(dust0, FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, FixedPoint96.Q96), FixedPoint96.Q96);
+        eval_.dustValueIn1 = dust1 + dust0ValueIn1;
+
+        if (dust0ValueIn1 >= dust1) {
+            eval_.signedDustImbalanceIn1 = int256(dust0ValueIn1 - dust1);
+        } else {
+            eval_.signedDustImbalanceIn1 = -int256(dust1 - dust0ValueIn1);
         }
     }
 
-    /*──────────────── Context Loading & Helpers ──────────────────────────────*/
-    
+    function _isBetterEval(ExactEval memory a, ExactEval memory b) internal pure returns (bool) {
+        bool aMintable = a.liquidity != 0;
+        bool bMintable = b.liquidity != 0;
+        if (aMintable != bMintable) return aMintable;
+
+        if (a.liquidity != b.liquidity) return a.liquidity > b.liquidity;
+
+        if (a.dustValueIn1 != b.dustValueIn1) return a.dustValueIn1 < b.dustValueIn1;
+
+        uint256 absA = _abs(a.signedDustImbalanceIn1);
+        uint256 absB = _abs(b.signedDustImbalanceIn1);
+        if (absA != absB) return absA < absB;
+
+        return a.grossAmountIn < b.grossAmountIn;
+    }
+
+    function _closedFormCorrectionDirection(
+        ExactEval memory predictedEval,
+        ExactEval memory lowEval,
+        ExactEval memory highEval
+    ) internal pure returns (int256) {
+        if (predictedEval.signedDustImbalanceIn1 == 0) return 0;
+        // Matching the low-side sign means the candidate is still below the root, so increase gross.
+        // Matching the high-side sign means the candidate is above the root, so decrease gross.
+        if (_sameSign(predictedEval.signedDustImbalanceIn1, lowEval.signedDustImbalanceIn1)) return 1;
+        if (_sameSign(predictedEval.signedDustImbalanceIn1, highEval.signedDustImbalanceIn1)) return -1;
+        return 0;
+    }
+
+    function _zeroEval() internal pure returns (ExactEval memory eval_) {}
+
+    function _shouldStopAfterStep(ExactEval memory eval_, uint256 grossToBoundary, uint256 available)
+        internal
+        pure
+        returns (bool)
+    {
+        return eval_.grossAmountIn < grossToBoundary || eval_.grossAmountIn == available;
+    }
+
+    function _sameSign(int256 a, int256 b) internal pure returns (bool) {
+        if (a == 0 || b == 0) return false;
+        return (a > 0 && b > 0) || (a < 0 && b < 0);
+    }
+
+    function _abs(int256 x) internal pure returns (uint256) {
+        return uint256(x >= 0 ? x : -x);
+    }
+
     function _loadPoolContext(
         address dex,
         address pool,
@@ -363,12 +941,8 @@ contract RebalancePlanner is Ownable {
     ) internal view returns (PoolContext memory pc) {
         if (t0 == address(0) || t1 == address(0) || t0 == t1) revert InvalidInput();
 
-        pc.token0 = t0;
-        pc.token1 = t1;
         pc.tickLower = tickLower;
         pc.tickUpper = tickUpper;
-        pc.dex = dex;
-        pc.factory = factory;
         pc.poolAddress = pool;
 
         bool isUSDC0 = t0 == USDC;
@@ -386,8 +960,6 @@ contract RebalancePlanner is Ownable {
             pc.isSlip = false;
         }
 
-        if (!_poolAllowed(pool)) revert PoolNotFound();
-
         address poolToken0;
         address poolToken1;
         try IUniswapV3Pool(pool).token0() returns (address p0) {
@@ -401,26 +973,19 @@ contract RebalancePlanner is Ownable {
             revert PoolNotFound();
         }
 
+        pc.token0 = poolToken0;
+        pc.token1 = poolToken1;
+
         if (!((poolToken0 == t0 && poolToken1 == t1) || (poolToken0 == t1 && poolToken1 == t0))) {
             revert UnsupportedPool();
         }
 
         // 1. Load Slot0 Safely (Low-level call to handle Interface Mismatches)
-        pc.sqrtPriceX96 = _safeGetSqrtPrice(pool);
+        (pc.sqrtPriceX96, pc.currentTick) = _safeGetSlot0(pool);
 
         // Load Liquidity
         try IUniswapV3Pool(pool).liquidity() returns (uint128 l) {
             pc.poolLiquidity = l;
-        } catch {}
-
-        // 2. Strict Fee Logic
-        bool feeFound = false;
-
-        try IUniswapV3Pool(pool).fee() returns (uint24 f) {
-            if (f > 0) {
-                pc.feePips = f;
-                feeFound = true;
-            }
         } catch {}
 
         try IUniswapV3Pool(pool).tickSpacing() returns (int24 ts) {
@@ -429,8 +994,16 @@ contract RebalancePlanner is Ownable {
             revert PoolNotFound();
         }
 
-        if (!feeFound && pc.isSlip) {
-            try IAerodromeFactory(factory).tickSpacingToFee(pc.tickSpacing) returns (uint24 f) {
+        bool feeFound = false;
+        if (pc.isSlip) {
+            try IAerodromeFactory(factory).getSwapFee(pool) returns (uint24 f) {
+                if (f > 0) {
+                    pc.feePips = f;
+                    feeFound = true;
+                }
+            } catch {}
+        } else {
+            try IUniswapV3Pool(pool).fee() returns (uint24 f) {
                 if (f > 0) {
                     pc.feePips = f;
                     feeFound = true;
@@ -440,68 +1013,185 @@ contract RebalancePlanner is Ownable {
 
         if (!feeFound) revert FeeFetchFailed();
 
-        (address tokenA, address tokenB) = poolToken0 < poolToken1
-            ? (poolToken0, poolToken1)
-            : (poolToken1, poolToken0);
-
-        if (pc.isSlip) {
-            try IAerodromeFactory(factory).getPool(tokenA, tokenB, pc.tickSpacing) returns (address expected) {
-                if (expected != pool) revert PoolNotFound();
-            } catch {
-                revert PoolNotFound();
-            }
-        } else {
-            try IUniswapV3Factory(factory).getPool(tokenA, tokenB, pc.feePips) returns (address expected) {
-                if (expected != pool) revert PoolNotFound();
-            } catch {
-                revert PoolNotFound();
-            }
-        }
-
         // 3. Tick Sanity
         if (
-            tickLower >= tickUpper ||
-            tickLower < TickMath.MIN_TICK ||
-            tickUpper > TickMath.MAX_TICK ||
-            (tickLower % pc.tickSpacing != 0) ||
-            (tickUpper % pc.tickSpacing != 0)
+            tickLower >= tickUpper || tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK
+                || (tickLower % pc.tickSpacing != 0) || (tickUpper % pc.tickSpacing != 0)
         ) revert InvalidTicks();
 
         pc.sqrtLowerX96 = TickMath.getSqrtRatioAtTick(tickLower);
         pc.sqrtUpperX96 = TickMath.getSqrtRatioAtTick(tickUpper);
     }
 
-    /**
-     * @dev Low-level staticcall to read `slot0`. Safely decodes just the first word (sqrtPriceX96).
-     * This avoids reverts when different forks return different struct lengths.
-     */
-    function _safeGetSqrtPrice(address pool) internal view returns (uint160 sqrtPriceX96) {
+    function _safeGetSlot0(address pool) internal view returns (uint160 sqrtPriceX96, int24 tick) {
         (bool success, bytes memory data) = pool.staticcall(abi.encodeWithSignature("slot0()"));
-        if (!success || data.length < 32) revert Slot0Failed();
-        
-        // Only decode the first 32 bytes (sqrtPriceX96)
-        // This is safe regardless of whether the return data is 192 bytes (Aerodrome) or 224 bytes (UniV3)
-        sqrtPriceX96 = abi.decode(data, (uint160));
-    }
-    
-    function _poolAllowed(address pool) internal view returns (bool) {
-        if (pool == address(0)) return false;
-        try ICLCore(CORE).isPoolAllowed(pool) returns (bool ok) {
-            return ok;
-        } catch {
-            return false;
-        }
+        if (!success || data.length < 64) revert Slot0Failed();
+
+        (sqrtPriceX96, tick) = abi.decode(data, (uint160, int24));
     }
 
     function _isBridgeToken(address token) internal view returns (bool) {
-        if (CORE == address(0) || token == address(0)) {
-            return false;
+        return token != address(0) && isBridgeTokenCached[token];
+    }
+}
+
+library RebalancePlannerUtils {
+    uint256 internal constant FEE_SCALE = 1e6;
+
+    error InvalidInput();
+
+    function solveClosedFormRootCandidates(
+        RebalancePlanner.PoolContext memory pc,
+        RebalancePlanner.PlanningState memory state,
+        bool zeroForOne,
+        uint160 sqrtTargetX96
+    ) public pure returns (uint160 root0X96, uint160 root1X96) {
+        (int256 a, int256 b, int256 c) = closedFormQuadratic(pc, state, zeroForOne);
+        if (a == 0 && b == 0) return (0, 0);
+
+        uint256 aAbs = abs(a);
+        uint256 bAbs = abs(b);
+        uint256 cAbs = abs(c);
+
+        uint256 shift = quadraticNormalizationShift(aAbs, bAbs, cAbs);
+        if (shift > 0) {
+            a >>= shift;
+            b >>= shift;
+            c >>= shift;
+            aAbs = abs(a);
+            bAbs = abs(b);
+            cAbs = abs(c);
         }
 
-        try ICLCore(CORE).isBridgeToken(token) returns (bool ok) {
-            return ok;
-        } catch {
-            return false;
+        if (a == 0) {
+            root0X96 = boundedRoot(scaledLinearRootQ96(b, c), state.sqrtPriceX96, sqrtTargetX96);
+            return (root0X96, 0);
         }
+
+        uint256 fourAC = aAbs == 0 || cAbs == 0 ? 0 : 4 * aAbs * cAbs;
+        uint256 b2 = bAbs * bAbs;
+        uint256 discriminant;
+
+        if ((a > 0 && c >= 0) || (a < 0 && c <= 0)) {
+            if (b2 < fourAC) return (0, 0);
+            discriminant = b2 - fourAC;
+        } else {
+            discriminant = b2 + fourAC;
+        }
+
+        uint256 sqrtDiscriminant = Math.sqrt(discriminant);
+        int256 root0Q96Signed = scaledQuadraticRootQ96(a, b, sqrtDiscriminant, true);
+        int256 root1Q96Signed = scaledQuadraticRootQ96(a, b, sqrtDiscriminant, false);
+
+        root0X96 = boundedRoot(root0Q96Signed, state.sqrtPriceX96, sqrtTargetX96);
+        root1X96 = boundedRoot(root1Q96Signed, state.sqrtPriceX96, sqrtTargetX96);
+    }
+
+    function closedFormQuadratic(
+        RebalancePlanner.PoolContext memory pc,
+        RebalancePlanner.PlanningState memory state,
+        bool zeroForOne
+    ) private pure returns (int256 a, int256 b, int256 c) {
+        uint256 feeDenom = FEE_SCALE - pc.feePips;
+        uint256 liq = state.liquidity;
+        uint256 lower = pc.sqrtLowerX96;
+        uint256 upper = pc.sqrtUpperX96;
+        uint256 sqrtStart = state.sqrtPriceX96;
+
+        if (zeroForOne) {
+            a = toInt(state.amount0) + toInt(grossMulDiv(liq, FixedPoint96.Q96, feeDenom, sqrtStart))
+                - toInt(FullMath.mulDiv(liq, FixedPoint96.Q96, upper));
+
+            b = toInt(liq) - toInt(grossScaled(liq, feeDenom))
+                + toInt(FullMath.mulDiv(state.amount1, FixedPoint96.Q96, upper))
+                + toInt(FullMath.mulDiv(liq, sqrtStart, upper))
+                - toInt(FullMath.mulDiv(lower, state.amount0, FixedPoint96.Q96))
+                - toInt(grossMulDiv(liq, lower, feeDenom, sqrtStart));
+
+            c = toInt(grossMulDiv(liq, lower, feeDenom, FixedPoint96.Q96)) - toInt(state.amount1)
+                - toInt(FullMath.mulDiv(liq, sqrtStart, FixedPoint96.Q96));
+        } else {
+            a = toInt(state.amount0) + toInt(FullMath.mulDiv(liq, FixedPoint96.Q96, sqrtStart))
+                - toInt(grossMulDiv(liq, FixedPoint96.Q96, feeDenom, upper));
+
+            b = toInt(grossScaled(liq, feeDenom)) - toInt(liq)
+                - toInt(FullMath.mulDiv(lower, state.amount0, FixedPoint96.Q96))
+                - toInt(FullMath.mulDiv(liq, lower, sqrtStart)) + toInt(grossMulDiv(liq, sqrtStart, feeDenom, upper))
+                + toInt(FullMath.mulDiv(state.amount1, FixedPoint96.Q96, upper));
+
+            c = toInt(FullMath.mulDiv(liq, lower, FixedPoint96.Q96)) - toInt(state.amount1)
+                - toInt(grossMulDiv(liq, sqrtStart, feeDenom, FixedPoint96.Q96));
+        }
+    }
+
+    function boundedRoot(int256 rootQ96, uint160 sqrtStartX96, uint160 sqrtTargetX96) private pure returns (uint160) {
+        if (rootQ96 <= 0 || rootQ96 > int256(uint256(type(uint160).max))) return 0;
+
+        uint160 root = uint160(uint256(rootQ96));
+        uint160 minRoot = sqrtStartX96 < sqrtTargetX96 ? sqrtStartX96 : sqrtTargetX96;
+        uint160 maxRoot = sqrtStartX96 > sqrtTargetX96 ? sqrtStartX96 : sqrtTargetX96;
+        if (root < minRoot || root > maxRoot) return 0;
+        return root;
+    }
+
+    function scaledQuadraticRootQ96(int256 a, int256 b, uint256 sqrtDiscriminant, bool addRoot)
+        private
+        pure
+        returns (int256)
+    {
+        int256 signedSqrt = int256(sqrtDiscriminant);
+        int256 numerator = -b + (addRoot ? signedSqrt : -signedSqrt);
+        int256 denominator = 2 * a;
+        return scaledSignedDiv(numerator, denominator, FixedPoint96.Q96);
+    }
+
+    function scaledLinearRootQ96(int256 b, int256 c) private pure returns (int256) {
+        return scaledSignedDiv(-c, b, FixedPoint96.Q96);
+    }
+
+    function scaledSignedDiv(int256 numerator, int256 denominator, uint256 scale) private pure returns (int256) {
+        if (numerator == 0 || denominator == 0) return 0;
+
+        bool negative = (numerator < 0) != (denominator < 0);
+        uint256 result = FullMath.mulDiv(abs(numerator), scale, abs(denominator));
+        if (result > uint256(type(int256).max)) return negative ? type(int256).min + 1 : type(int256).max;
+        return negative ? -int256(result) : int256(result);
+    }
+
+    function quadraticNormalizationShift(uint256 aAbs, uint256 bAbs, uint256 cAbs) private pure returns (uint256) {
+        uint256 shift;
+        if (bAbs > 0) {
+            uint256 bBits = Math.log2(bAbs) + 1;
+            if (bBits > 127) shift = bBits - 127;
+        }
+        if (aAbs > 0 && cAbs > 0) {
+            uint256 acBits = Math.log2(aAbs) + Math.log2(cAbs) + 2;
+            if (acBits > 253) {
+                uint256 acShift = (acBits - 253 + 1) / 2;
+                if (acShift > shift) shift = acShift;
+            }
+        }
+        return shift;
+    }
+
+    function grossMulDiv(uint256 left, uint256 numerator, uint256 feeDenom, uint256 denominator)
+        private
+        pure
+        returns (uint256)
+    {
+        return FullMath.mulDiv(left * FEE_SCALE, numerator, feeDenom * denominator);
+    }
+
+    function grossScaled(uint256 value, uint256 feeDenom) private pure returns (uint256) {
+        return FullMath.mulDiv(value, FEE_SCALE, feeDenom);
+    }
+
+    function toInt(uint256 x) private pure returns (int256) {
+        if (x > uint256(type(int256).max)) revert InvalidInput();
+        return int256(x);
+    }
+
+    function abs(int256 x) private pure returns (uint256) {
+        return uint256(x >= 0 ? x : -x);
     }
 }
