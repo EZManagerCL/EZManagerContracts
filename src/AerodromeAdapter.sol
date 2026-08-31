@@ -1032,8 +1032,7 @@ contract AerodromeAdapter is Ownable, ReentrancyGuard, Pausable, ICLDexAdapter {
         address token1 = p.token1();
         if (tokenIn != token0 && tokenIn != token1) revert InvalidParam();
         bool zeroForOne = (tokenIn == token0);
-        int24 tickSpacing = p.tickSpacing();
-        uint24 fee = FACTORY.tickSpacingToFee(tickSpacing);
+        uint24 fee = FACTORY.getSwapFee(pool);
 
         uint256 amountInPostFee = FullMath.mulDiv(amountIn, (1_000_000 - fee), 1_000_000);
         if (amountInPostFee == 0) return 0;
@@ -1085,8 +1084,7 @@ contract AerodromeAdapter is Ownable, ReentrancyGuard, Pausable, ICLDexAdapter {
         address token1 = p.token1();
         if (tokenIn != token0 && tokenIn != token1) revert InvalidParam();
         bool zeroForOne = (tokenIn == token0);
-        int24 tickSpacing = p.tickSpacing();
-        uint24 fee = FACTORY.tickSpacingToFee(tickSpacing);
+        uint24 fee = FACTORY.getSwapFee(pool);
 
         uint256 amountInPostFee = FullMath.mulDiv(amountIn, (1_000_000 - fee), 1_000_000);
         if (amountInPostFee == 0) return 0;
