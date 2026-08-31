@@ -13,7 +13,6 @@ import {
     IRebalancePlanner,
     PendingFeesResult,
     Position,
-    PositionDetails,
     RebalanceParams
 } from "../Interfaces.sol";
 
@@ -191,9 +190,7 @@ library CLManagerUtils {
 
             _requireOwnerOrBot(p.owner, p.botAllowed, callerIsBot);
 
-            // Use CORE's on-chain computed pending USDC for the position.
-            PositionDetails memory det = cfg.CORE.getPositionDetails(key);
-            uint256 feesCollectedAtStart = det.pendingFeesUSDC;
+            uint256 feesCollectedAtStart = _pendingFeesUSDC(cfg, p, key);
 
             uint16 botFeeBpsLocal = _applyFeeDiscount(p.owner, botFeeBps_, 0);
             (uint16 earnedProtocolFeeBps, address reserve) = _earnedProtocolFeeConfig(cfg, p.owner);
@@ -304,14 +301,31 @@ library CLManagerUtils {
             uint256 feesCollectedAtStart = 0;
             uint256 returnedUSDC = 0;
 
-            // try catch so Valuation or non-essential accounting errors can't brick emergency exit.
+            // Valuation or non-essential accounting errors can't brick emergency exit.
             // This is the only place where we tolerate this.
-            try cfg.CORE.getPositionDetails(key) returns (PositionDetails memory det) {
-                // Snapshot pending USDC-denominated fees at the time of return.
-                feesCollectedAtStart = det.pendingFeesUSDC;
-            } catch {
-                feesCollectedAtStart = 0;
-            }
+            bytes32[] memory feeKeys = new bytes32[](1);
+            feeKeys[0] = key;
+            try cfg.CORE.pendingFees(feeKeys) returns (PendingFeesResult[] memory pending) {
+                PendingFeesResult memory fees = pending[0];
+                if (fees.owed0 > 0) {
+                    if (p.token0 == address(cfg.USDC)) {
+                        feesCollectedAtStart += fees.owed0;
+                    } else {
+                        try cfg.VALUATION.usdcValue(p.dex, p.token0, fees.owed0) returns (uint256 value0) {
+                            feesCollectedAtStart += value0;
+                        } catch {}
+                    }
+                }
+                if (fees.owed1 > 0) {
+                    if (p.token1 == address(cfg.USDC)) {
+                        feesCollectedAtStart += fees.owed1;
+                    } else {
+                        try cfg.VALUATION.usdcValue(p.dex, p.token1, fees.owed1) returns (uint256 value1) {
+                            feesCollectedAtStart += value1;
+                        } catch {}
+                    }
+                }
+            } catch {}
 
             try cfg.CORE.positionValueUSDCSingle(key) returns (uint256 returnedUSDC_) {
                 returnedUSDC = returnedUSDC_;
@@ -354,8 +368,8 @@ library CLManagerUtils {
             if (p.owner == address(0) || p.tokenId == 0) revert PositionNotFound();
             _requireOwnerOrBot(p.owner, p.botAllowed, callerIsBot);
 
-            PositionDetails memory det = cfg.CORE.getPositionDetails(key);
-            uint256 remainingLossUSDC = _lossBudgetUSDC(det.pendingFeesUSDC, slippageBps);
+            uint256 pendingFeesUSDC = _pendingFeesUSDC(cfg, p, key);
+            uint256 remainingLossUSDC = _lossBudgetUSDC(pendingFeesUSDC, slippageBps);
             (uint16 earnedProtocolFeeBps, address reserve) = _earnedProtocolFeeConfig(cfg, p.owner);
 
             (uint256 fee0, uint256 fee1, uint256 outUSDC, ) =
@@ -586,7 +600,7 @@ library CLManagerUtils {
             withdrawFraction = LIQUIDITY_PERCENTAGE_PRECISION - 1;
         }
 
-        PositionDetails memory detBefore = cfg.CORE.getPositionDetails(key);
+        uint256 pendingFeesUSDCBefore = _pendingFeesUSDC(cfg, p, key);
 
         uint256 remainingLossUSDC = _lossBudgetUSDC(remainingTarget, slippageBps);
         uint256 usdcOut = ICLDexAdapter(p.dex).removeLiquidityBpsUSDC(
@@ -611,13 +625,13 @@ library CLManagerUtils {
             cfg.CORE.adjustTotalDeposited(key, -int256(depositedDebit));
         }
 
-        PositionDetails memory detAfter = cfg.CORE.getPositionDetails(key);
+        uint256 pendingFeesUSDCAfter = _pendingFeesUSDC(cfg, p, key);
         feesCollected = 0;
-        if (detAfter.pendingFeesUSDC > detBefore.pendingFeesUSDC) {
+        if (pendingFeesUSDCAfter > pendingFeesUSDCBefore) {
             feesCollected = 0;
         } else {
-            feesCollected = detBefore.pendingFeesUSDC > detAfter.pendingFeesUSDC
-                ? detBefore.pendingFeesUSDC - detAfter.pendingFeesUSDC
+            feesCollected = pendingFeesUSDCBefore > pendingFeesUSDCAfter
+                ? pendingFeesUSDCBefore - pendingFeesUSDCAfter
                 : 0;
         }
 
@@ -657,8 +671,7 @@ library CLManagerUtils {
         Position memory p = cfg.CORE.getPosition(key);
         if (newTickLower == p.tickLower && newTickUpper == p.tickUpper) revert RangeUnchanged();
 
-        PositionDetails memory det = cfg.CORE.getPositionDetails(key);
-        uint256 feesCollectedAtStart = det.pendingFeesUSDC;
+        uint256 feesCollectedAtStart = _pendingFeesUSDC(cfg, p, key);
 
         if ((newTickLower % p.tickSpacing) != 0 || (newTickUpper % p.tickSpacing) != 0) revert InvalidTickRange();
         if (newTickLower < -887272 || newTickUpper > 887272) revert InvalidTickRange();
@@ -784,13 +797,6 @@ library CLManagerUtils {
             cfg.USDC.safeTransfer(msg.sender, botFeeUSDC);
             emit BotFeePaid(msg.sender, key, newTokenId, botFeeUSDC, FeeType.ChangeRange);
         }
-    }
-
-    function tokenValueUSDC(IValuation valuation, IERC20 usdc, address dex, address token, uint256 amount) external view returns (uint256) {
-        if (amount == 0) return 0;
-        if (token == address(usdc)) return amount;
-        uint256 value = valuation.usdcValue(dex, token, amount);
-        return value;
     }
 
     function _earnedProtocolFeeConfig(Config memory cfg, address wallet)
@@ -1086,6 +1092,17 @@ library CLManagerUtils {
         if (token == address(cfg.USDC)) return amount;
         uint256 value = cfg.VALUATION.usdcValue(dex, token, amount);
         return value;
+    }
+
+    function _pendingFeesUSDC(Config memory cfg, Position memory p, bytes32 key) internal view returns (uint256) {
+        bytes32[] memory keys = new bytes32[](1);
+        keys[0] = key;
+
+        PendingFeesResult[] memory pending = cfg.CORE.pendingFees(keys);
+        PendingFeesResult memory fees = pending[0];
+
+        return _tokenValueUSDC(cfg, p.dex, p.token0, fees.owed0)
+            + _tokenValueUSDC(cfg, p.dex, p.token1, fees.owed1);
     }
 
     function _quotedPositionValue(Config memory cfg, bytes32 key, Position memory p)

@@ -553,9 +553,8 @@ contract CLManager is ReentrancyGuard, Pausable, Ownable {
             dex: dex
         }));
 
-        PositionDetails memory details = CORE.getPositionDetails(key);
         if (botAllowed) CORE.setBotAllowedForPosition(key, true);
-        uint256 importedUSDC = details.valueUSDCNow;
+        uint256 importedUSDC = CORE.positionValueUSDCSingle(key);
         if (importedUSDC < MINIMUM_OPEN_USDC) revert PositionTooSmall();
         if (importedUSDC > 0) {
             CORE.adjustTotalDeposited(key, int256(importedUSDC));
